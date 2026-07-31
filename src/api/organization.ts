@@ -1,5 +1,14 @@
+import type { Cases } from "@/api/_types";
 import { query } from "@/lib/db";
-import { post } from "@/lib/params";
+import { post, str } from "@/lib/params";
+import {
+  MESSAGE_ERROR,
+  NULL_JSON_ARRAY,
+  STATUS_ERROR,
+  STATUS_SUCCESS,
+  phpJson,
+} from "@/lib/response";
+import { binds, cols } from "@/lib/sql";
 
 /**
  * The 25 fields insert_organization reads from $_POST, in the order the PHP
@@ -46,8 +55,8 @@ const FIELDS = [
  * unique index -- the MySQL table has no primary key at all). The caller cannot
  * observe the difference: the PHP response says "Inserted/Updated" either way.
  */
-const UPSERT_SQL = `INSERT INTO organization (${FIELDS.map((f) => `"${f}"`).join(", ")})
-VALUES (${FIELDS.map((_, i) => `$${i + 1}`).join(", ")})
+const UPSERT_SQL = `INSERT INTO organization (${cols(FIELDS)})
+VALUES (${binds(FIELDS)})
 ON CONFLICT ("OrganizationCode") DO UPDATE SET
   ${FIELDS.slice(1)
     .map((f) => `"${f}" = EXCLUDED."${f}"`)
@@ -71,3 +80,39 @@ export async function insertOrganization(fd: FormData): Promise<string> {
     return "ERROR: " + (e instanceof Error ? e.message : String(e));
   }
 }
+
+export const cases: Cases = [
+  // firefly_api.php lines 666-684. The only endpoint whose helper returns an
+  // error *message* rather than 'FALSE', so it does not use trueFalseJson.
+  [
+    "insert_organization",
+    async (fd) => {
+      let STATUS = STATUS_ERROR;
+      let MESSAGE = MESSAGE_ERROR;
+      let DATA: unknown = null;
+
+      const ACTION = await insertOrganization(fd);
+
+      if (ACTION) {
+        if (ACTION.startsWith("ERROR:")) {
+          STATUS = STATUS_ERROR;
+          // substring(6) leaves the space after "ERROR:", so the rendered
+          // message has two spaces after "Failed!" -- as the PHP does.
+          MESSAGE =
+            "Insertion/Updation of Organization Failed! " + ACTION.substring(6);
+        } else if (ACTION === "TRUE") {
+          STATUS = STATUS_SUCCESS;
+          MESSAGE =
+            "Succesfully Inserted/Updated Organization with Code : " +
+            str(fd, "OrganizationCode");
+          DATA = NULL_JSON_ARRAY;
+        }
+      } else {
+        STATUS = STATUS_ERROR;
+        MESSAGE = "Unknown error occurred.";
+      }
+
+      return phpJson({ STATUS, MESSAGE, DATA });
+    },
+  ],
+];

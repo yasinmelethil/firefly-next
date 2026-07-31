@@ -26,8 +26,14 @@ CREATE TABLE IF NOT EXISTS "user" (
     "SaleTaxIncDiscount" smallint    NOT NULL,
     "DefCashLedger"      varchar(20) NOT NULL,
     "IsAdmin"            smallint    NOT NULL,  -- tinyint(4) in MySQL, not tinyint(1)
-    -- Lowercase 'id', unlike rout.RoutId and ledger.RoutId. Mirrored as declared.
-    "Routid"             varchar(20) NOT NULL,
+    -- MySQL declares this "Routid", lowercase 'id'. Spelled "RoutId" here, per the
+    -- README rule that the API payload's spelling wins: every PHP reference uses
+    -- RoutId, both the writes in insert_user and the login read at
+    -- firefly_api.php line 4614, which names it in the select list -- so MySQL
+    -- already emits "RoutId" on the wire and only the DDL disagrees. Unquoted
+    -- MySQL identifiers hide the difference; quoted PostgreSQL ones do not, and
+    -- "Routid" here would make insert_user fail outright.
+    "RoutId"             varchar(20) NOT NULL,
     "UseOnlyRoutLedgers" smallint    NOT NULL DEFAULT 0,
     "DefSaleRate"        varchar(20) NOT NULL,
     "DefWarehouseId"     varchar(20) NOT NULL,

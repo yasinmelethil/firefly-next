@@ -18,7 +18,13 @@ CREATE TABLE IF NOT EXISTS product (
     "UnitName"            varchar(50)  NOT NULL,
     "UnitShortName"       varchar(50)  NOT NULL,
     "ProductName"         varchar(100) NOT NULL,
-    "ImagePath"           varchar(100) NOT NULL,
+    -- MySQL declares this NOT NULL with no default. insert_productwtimage omits
+    -- ImagePath from its INSERT column list entirely -- that omission is the whole
+    -- point of the endpoint, which updates a product while leaving its existing
+    -- image alone -- and this server's non-strict sql_mode then supplies the
+    -- implicit default ''. That is why 63 of the 87 live products hold ''.
+    -- PostgreSQL has no implicit default, so without this the INSERT would fail.
+    "ImagePath"           varchar(100) NOT NULL DEFAULT '',
     "InventoryDetailsId"  varchar(31)  NOT NULL,
     "InventoryGroupId"    varchar(20)  NOT NULL,
     "MRP"                 varchar(50)  NOT NULL,

@@ -31,6 +31,10 @@ $Psql  = 'C:\Program Files\PostgreSQL\18\bin\psql.exe'
 $Renames = @{
     'organization.DefCustSIBilltype' = 'DefCustSIBillType'
     'organization.DefCustSRBilltype' = 'DefCustSRBillType'
+    # Same rule, found while porting insert_user: MySQL declares "Routid" but
+    # every PHP reference writes RoutId, including the login SELECT at
+    # firefly_api.php line 4614 that puts the name on the wire.
+    'user.Routid'                    = 'RoutId'
 }
 
 # Tables given a primary key PostgreSQL needs for ON CONFLICT but MySQL lacks.
@@ -90,7 +94,15 @@ ORDER BY TABLE_NAME, ORDINAL_POSITION;
 $myRows = & $Mysql -u root -N -B -e $myQuery
 if ($LASTEXITCODE -ne 0) { throw "mysql.exe failed. Is XAMPP running?" }
 
-$my = @{}
+<#
+    Ordinal, not the default. A PowerShell hashtable compares keys
+    case-insensitively, which is exactly the difference this script exists to
+    catch: MySQL identifiers are case-insensitive and PostgreSQL quoted ones are
+    not, so "user.Routid" and "user.RoutId" must not look up as the same column.
+    With the default comparer a case-only rename passes silently -- and all three
+    entries in $Renames are case-only renames.
+#>
+$my = [System.Collections.Hashtable]::new([System.StringComparer]::Ordinal)
 $myTables = New-Object System.Collections.Generic.HashSet[string]
 foreach ($line in $myRows) {
     if (-not $line) { continue }
@@ -115,7 +127,7 @@ $env:PGPASSWORD = 'firefly_dev_pw'
 $pgRows = & $Psql -U firefly_app -d $PgDatabase -h localhost -tA -F "`t" -c $pgQuery
 if ($LASTEXITCODE -ne 0) { throw "psql failed. Is PostgreSQL running?" }
 
-$pg = @{}
+$pg = [System.Collections.Hashtable]::new([System.StringComparer]::Ordinal)
 $pgTables = New-Object System.Collections.Generic.HashSet[string]
 foreach ($line in $pgRows) {
     if (-not $line) { continue }
