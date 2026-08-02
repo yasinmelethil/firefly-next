@@ -283,7 +283,57 @@ function Get-JsonTail {
 }
 
 <#
+    The ordered JSON key list of DATA[0], for Mode 'Keys'.
+
+    -Path walks into a nested array before reading the keys, so
+    'products' gives the keys of DATA[0].products[0].
+
+    ConvertFrom-Json preserves property order in PowerShell 5.1, which is what
+    makes this a meaningful assertion: it catches a dropped column, a misspelled
+    alias, or a column emitted in the wrong position.
+#>
+function Get-DataKeys {
+    param([string]$Body, [string]$Path = '')
+    try { $o = (Get-JsonTail $Body) | ConvertFrom-Json } catch { return '(unparseable)' }
+    $d = $o.DATA
+    if ($d -isnot [array] -or $d.Count -eq 0) { return "(no rows) $($o.STATUS) $($o.MESSAGE)" }
+    $row = $d[0]
+    foreach ($seg in ($Path -split '\.' | Where-Object { $_ })) {
+        $row = $row.$seg
+        if ($row -is [array]) {
+            if ($row.Count -eq 0) { return '(no nested rows)' }
+            $row = $row[0]
+        }
+    }
+    return ($row.PSObject.Properties.Name -join ',')
+}
+
+<#
+    DATA as an order-insensitive multiset of rows, for Mode 'Set'.
+
+    Each row is re-serialised compactly and the list is sorted, so two responses
+    carrying the same rows in a different order compare equal.
+#>
+function Get-DataRowSet {
+    param([string]$Body)
+    try { $o = (Get-JsonTail $Body) | ConvertFrom-Json } catch { return '(unparseable)' }
+    $d = $o.DATA
+    if ($d -isnot [array]) { return "(not an array) $($o.STATUS) $($o.MESSAGE) $($o.DATA)" }
+    return (($d | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 10 }) | Sort-Object) -join "`n"
+}
+
+<#
     Mode 'Bytes'  - responses must be byte-identical.
+    Mode 'Set'    - DATA must hold the same rows, in any order. For the reads
+                    whose PHP query carries no ORDER BY, where row order is
+                    engine-determined and genuinely differs between MySQL and
+                    PostgreSQL. Asserts every value of every row; only the
+                    sequence is excused. See "Known divergences" in the README.
+    Mode 'Keys'   - the ordered JSON key list of DATA[0] must agree, for reads
+                    whose row sets cannot be made identical across the two
+                    databases (get_ledgers and friends read whole tables with no
+                    Status or date filter to scope them). Pair it with a
+                    zero-row 'Bytes' case, which asserts the envelope exactly.
     Mode 'Status' - only the STATUS field must agree. Used where both sides fail
                     for the same reason but each leaks its own driver's wording
                     (MySQL "Column 'X' cannot be null" vs PostgreSQL's not-null
@@ -299,7 +349,8 @@ function Compare-Case {
         [string]$Name,
         [hashtable]$Body,
         [string]$Method = 'POST',
-        [ValidateSet('Bytes','Status','Json')][string]$Mode = 'Bytes'
+        [ValidateSet('Bytes','Status','Json','Keys','Set')][string]$Mode = 'Bytes',
+        [string]$KeyPath = ''
     )
 
     $php  = Invoke-Endpoint -Url $PhpUrl  -Body $Body -Method $Method
@@ -309,6 +360,12 @@ function Compare-Case {
         $same = ($php.Body -ceq $next.Body) -and ($php.Status -eq $next.Status)
     } elseif ($Mode -eq 'Json') {
         $same = ((Get-JsonTail $php.Body) -ceq (Get-JsonTail $next.Body)) -and ($php.Status -eq $next.Status)
+    } elseif ($Mode -eq 'Keys') {
+        $phpKeys  = Get-DataKeys -Body $php.Body  -Path $KeyPath
+        $nextKeys = Get-DataKeys -Body $next.Body -Path $KeyPath
+        $same = ($phpKeys -ceq $nextKeys) -and ($php.Status -eq $next.Status)
+    } elseif ($Mode -eq 'Set') {
+        $same = ((Get-DataRowSet $php.Body) -ceq (Get-DataRowSet $next.Body)) -and ($php.Status -eq $next.Status)
     } else {
         $same = ((Get-Status $php.Body) -ceq (Get-Status $next.Body)) -and ($php.Status -eq $next.Status)
     }
@@ -317,6 +374,11 @@ function Compare-Case {
         $script:Pass++
         Write-Host "PASS  $Name" -ForegroundColor Green
         if ($Mode -eq 'Bytes') {
+            Write-Host "      $($php.Body)" -ForegroundColor DarkGray
+        } elseif ($Mode -eq 'Keys') {
+            Write-Host "      same keys: $(Get-DataKeys -Body $php.Body -Path $KeyPath)" -ForegroundColor DarkGray
+        } elseif ($Mode -eq 'Set') {
+            Write-Host "      same rows, order not asserted (no ORDER BY in the PHP)" -ForegroundColor DarkGray
             Write-Host "      $($php.Body)" -ForegroundColor DarkGray
         } else {
             Write-Host "      both STATUS=$(Get-Status $php.Body); driver text differs by design:" -ForegroundColor DarkGray
@@ -936,6 +998,773 @@ UNION ALL SELECT 'pdc.Party',    "PartyLedgerId" FROM pdcdetails WHERE "PDCDetai
 '@
 
 Reset-SyncRows
+
+# ===========================================================================
+# 93-118. The POS billing loop.
+#
+# Different comparison problems from the sync loop, and each needs its own
+# answer:
+#
+#   - Four reads have no Status or date filter at all, so the two databases can
+#     never hold the same rows. Asserted twice: a zero-row case for the exact
+#     envelope, and Mode 'Keys' for the column list on real data.
+#   - The date-window reads are scoped to the year 2099, which no production
+#     row can fall into, so both servers see only these fixtures.
+#   - The writes read live state to pick their next number, so the series has
+#     to be equalised before every single call. See Reset-WriteSeries.
+# ===========================================================================
+
+$PosUser  = 'ZZPOSUSR'
+$PosCat   = 'ZZPOSCAT'
+$PosInv   = 'ZZPOSINV-000000001'
+$PosBill  = 'ZZPBT'      # the read fixtures
+$PosWBill = 'ZZWBT'      # insert_orderbybilltype
+$PosCBill = 'ZZCBT'      # insert_ordercancelbybilltype
+$PosSBill = 'ZZSBT'      # insert_salebybilltypewithpdc
+
+function Set-SettingsKey {
+    param([string]$Key, [string]$Value)
+    & $Mysql -u root fireflydb -e "INSERT INTO settings_common (``key``,``value``) VALUES ('$Key','$Value') ON DUPLICATE KEY UPDATE ``value``='$Value';" 2>&1 | Out-Null
+    Invoke-Psql -Quiet "INSERT INTO settings_common (`"key`",`"value`") VALUES ('$Key','$Value') ON CONFLICT (`"key`") DO UPDATE SET `"value`" = EXCLUDED.`"value`";"
+}
+
+function Remove-SettingsKey {
+    param([string]$Key)
+    & $Mysql -u root fireflydb -e "DELETE FROM settings_common WHERE ``key``='$Key';" 2>&1 | Out-Null
+    Invoke-Psql -Quiet "DELETE FROM settings_common WHERE `"key`" = '$Key';"
+}
+
+<#
+    Row capture for the stored-state assertions.
+
+    Both return headerless, tab-separated text so the two can be compared
+    directly. They exist because a stored-row check cannot be done by printing
+    each side in turn: the write cases have to reset the series between the PHP
+    run and the Next run, and that reset clears BOTH databases -- so MySQL's
+    rows are already gone by the time the Next run finishes. Capture each side
+    immediately after its own run, then compare the two strings.
+#>
+function Get-MysqlRows {
+    param([string]$Sql)
+    $out = & $Mysql -u root fireflydb -N -B -e $Sql 2>&1
+    return (($out | Where-Object { $_ -ne '' }) -join "`n")
+}
+
+function Get-PgRows {
+    param([string]$Sql)
+    $env:PGPASSWORD = 'firefly_dev_pw'
+    $tmp = Join-Path $env:TEMP ("ffapi_" + [guid]::NewGuid().ToString('N') + ".sql")
+    Set-Content -Path $tmp -Value $Sql -Encoding utf8
+    try {
+        $out = & $Psql -U firefly_app -d fireflydb_test -h localhost -t -A -F "`t" -v ON_ERROR_STOP=1 -f $tmp 2>&1
+        return (($out | Where-Object { $_ -ne '' }) -join "`n")
+    } finally {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Assert-SameRows {
+    param([string]$Name, [string]$Mysql, [string]$Postgres)
+    if ($Mysql -ceq $Postgres) {
+        $script:Pass++
+        Write-Host "PASS  $Name" -ForegroundColor Green
+        foreach ($line in ($Mysql -split "`n")) { Write-Host "      $line" -ForegroundColor DarkGray }
+    } else {
+        $script:Fail++
+        Write-Host "FAIL  $Name" -ForegroundColor Red
+        Write-Host "      MYSQL $($Mysql -replace "`n", ' | ')" -ForegroundColor Yellow
+        Write-Host "      PG    $($Postgres -replace "`n", ' | ')" -ForegroundColor Cyan
+    }
+}
+
+# A single value out of PostgreSQL, unaligned and untitled. Invoke-Psql prints a
+# formatted table, which is right for the eyeball comparisons but useless when
+# the value has to be compared in code.
+function Get-PgScalar {
+    param([string]$Sql)
+    $env:PGPASSWORD = 'firefly_dev_pw'
+    $tmp = Join-Path $env:TEMP ("ffapi_" + [guid]::NewGuid().ToString('N') + ".sql")
+    Set-Content -Path $tmp -Value $Sql -Encoding utf8
+    try {
+        $out = & $Psql -U firefly_app -d fireflydb_test -h localhost -t -A -v ON_ERROR_STOP=1 -f $tmp 2>&1
+        return ($out | Where-Object { $_ -ne '' } | Select-Object -First 1)
+    } finally {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Reset-PosRows {
+    $sql = @'
+DELETE FROM ordercanceldetails WHERE OrderCancelMasterId LIKE 'ZZPOS%' OR OrderCancelMasterId LIKE 'ZZCBT-%';
+DELETE FROM ordercancelmaster  WHERE OrderCancelMasterId LIKE 'ZZPOS%' OR BillTypeId LIKE 'ZZ%';
+DELETE FROM orderdetails       WHERE ordermstr_id LIKE 'ZZPOS%' OR ordermstr_id LIKE 'ZZWBT-%';
+DELETE FROM ordermaster        WHERE OrderMasterId LIKE 'ZZPOS%' OR BillTypeId LIKE 'ZZ%';
+DELETE FROM pdcdetails         WHERE ReferenceId LIKE 'ZZPOS%' OR ReferenceId LIKE 'ZZSBT-%';
+DELETE FROM salesdetails       WHERE SaleMasterId LIKE 'ZZPOS%' OR SaleMasterId LIKE 'ZZSBT-%';
+DELETE FROM salemaster         WHERE SaleMasterId LIKE 'ZZPOS%' OR BillTypeId LIKE 'ZZ%';
+DELETE FROM warehousestock     WHERE InventoryDetailsId LIKE 'ZZPOS%';
+DELETE FROM product            WHERE InventoryDetailsId LIKE 'ZZPOS%';
+DELETE FROM category           WHERE InventoryGroupId LIKE 'ZZPOS%';
+DELETE FROM billtype           WHERE BillTypeId LIKE 'ZZ%';
+DELETE FROM ledger             WHERE LedgerId LIKE 'ZZBANK%';
+'@
+    Invoke-MysqlFile ($sql -replace '`user`', '`user`')
+    Invoke-Psql -Quiet ($sql -replace '(?m)WHERE (\w+)', 'WHERE "$1"' -replace '(?m)OR (\w+) LIKE', 'OR "$1" LIKE')
+    & $Mysql -u root fireflydb -e "DELETE FROM ``user`` WHERE UserId = '$PosUser';" 2>&1 | Out-Null
+    Invoke-Psql -Quiet "DELETE FROM `"user`" WHERE `"UserId`" = '$PosUser';"
+}
+
+<#
+    Seeds the POS read fixtures into both databases, dated 2099.
+
+    Four orders, chosen so every branch of the cancellation maths is exercised:
+
+      ZZPOSOM-A  lines, no cancellations        -> CancelStatus 'NONE'
+      ZZPOSOM-B  one line partly cancelled      -> 'PARTIAL'
+      ZZPOSOM-C  its only line fully cancelled  -> 'FULL', and dropped from the
+                 two list endpoints by their EXISTS filter
+      ZZPOSOM-D  no order lines at all          -> the zero-row COALESCE branch,
+                 which is where MySQL prints 0.00000000 and an untyped
+                 PostgreSQL literal would print 0
+
+    Three sales, covering all three FIND_IN_SET haystack shapes: a comma-joined
+    pair, an empty string, and NULL. ZZPOSOM-A is billed by the first of them,
+    so the "not yet billed" filter has something to exclude -- which is why the
+    orders live on 2099-07-01 and that sale on 2099-07-02.
+
+    ZZPOSSM-3 has PaidAmount 0 so get_allsaleswithoutpaidamount returns exactly
+    one row while get_allsales returns three.
+#>
+function Seed-PosRows {
+    $sql = @"
+INSERT INTO ``user`` (UserId,OrganizationCode,Name,UserName,Password,Phone,DefSOBillType,DefSOCBillType,DefSIBillType,DefRVBillType,DefPVBillType,DefPOBillType,DefSRBillType,DefJVBillType,SaleTaxIncDiscount,DefCashLedger,IsAdmin,RoutId,UseOnlyRoutLedgers,DefSaleRate,DefWarehouseId,DefCardBank)
+VALUES ('$PosUser','ZZ01','ZZ Pos','ZZ Pos User','x','','','','','','','','','',0,'',0,'',0,'','','');
+
+INSERT INTO category (OrganizationCode,InventoryGroupId,GroupName,ParentGroup,ImagePath,Colour)
+VALUES ('ZZ01','$PosCat','ZZ Pos Cat','','zzcat.jpg','#fff');
+
+-- LedgerType 'B' so get_bankdetails has a row to shape-check against.
+-- fireflydb_test holds no real bank ledgers, and the key list is all that
+-- case asserts.
+INSERT INTO ledger (led_id,OrganizationCode,CentreCode,LedgerId,LedgerType,LedgerName,RegionalName,Address,Email,Phone,UserName,mypassword,noofseats,seatstaken,CurrentBalance,LedgerCode,CustomCode,RoutId,TINNumber,IsActive)
+VALUES (970301,'ZZ01','ZZ01','ZZBANK01','B','ZZ Pos Bank','','','','','','',0,0,0,'ZZBLC','ZZBCC','','',1);
+
+INSERT INTO product (OrganizationCode,UnitId,UnitName,UnitShortName,ProductName,ImagePath,InventoryDetailsId,InventoryGroupId,MRP,MOP,MLOP,PurchaseRate,AvgRate,LastPurchaseRate,SaleRate,isVeg,Description,CurrentStock,OrderLimit,TaxId,AddTaxId,AddTaxId1,Barcode,CustomBarcode,Code,HSNCode,Size,Colour,ProductRegionalName,UnitRegionalName,StockMaster)
+VALUES ('ZZ01','ZZU','Piece','Pc','ZZ Pos Product','','$PosInv','$PosCat','100.00','90.00','85.00','70.00','72.00','71.00','99.00',1,'pos',0,0,'ZZNOTAX','ZZNOTAX','ZZNOTAX','ZZB','ZZCB','ZZC','ZZH','M','red','','',0);
+
+INSERT INTO ordermaster (AUTOID,OrganizationCode,BillTypeId,OrderMasterId,OrderNumber,OrderDate,PartyDetails,LedgerId,NoofChair,Status,CreatedByUser,CreatedTimeStamp,TotalAmount,Description,PosMode)
+VALUES (970001,'ZZ01','$PosBill','ZZPOSOM-A','ZZPOSON-A','2099-07-01 10:00:00','ZZ party','ZZLED01',2,'N','$PosUser','2099-07-01 10:00:00',300,'','counter'),
+       (970002,'ZZ01','$PosBill','ZZPOSOM-B','ZZPOSON-B','2099-07-01 11:00:00','ZZ party','ZZLED01',0,'N','$PosUser','2099-07-01 11:00:00',300,'','parcel'),
+       (970003,'ZZ01','$PosBill','ZZPOSOM-C','ZZPOSON-C','2099-07-01 12:00:00','ZZ party','ZZLED01',0,'N','$PosUser','2099-07-01 12:00:00',100,'',NULL),
+       (970004,'ZZ01','$PosBill','ZZPOSOM-D','ZZPOSON-D','2099-07-01 13:00:00','ZZ party','ZZLED01',0,'N','$PosUser','2099-07-01 13:00:00',0,'',NULL);
+
+INSERT INTO orderdetails (orderdtl_id,ordermstr_id,InventoryDetailsId,UnitId,Quantity,Rate,TotalAmount,Description,CreatedByUser,CreatedTimeStamp)
+VALUES (970101,'ZZPOSOM-A','$PosInv','ZZU',3,100,300,'ZZ line A','$PosUser','2099-07-01 10:00:00'),
+       (970102,'ZZPOSOM-B','$PosInv','ZZU',3,100,300,'ZZ line B','$PosUser','2099-07-01 11:00:00'),
+       (970103,'ZZPOSOM-C','$PosInv','ZZU',1,100,100,'ZZ line C','$PosUser','2099-07-01 12:00:00');
+
+INSERT INTO ordercancelmaster (AUTOID,OrganizationCode,BillTypeId,OrderCancelMasterId,OrderCancelNumber,OrderCancelDate,OrderMasterId,PartyDetails,LedgerId,Status,CreatedByUser,CreatedTimeStamp,TotalAmount,Description)
+VALUES (970005,'ZZ01','$PosBill','ZZPOSOC-1','ZZPOSOCN-1','2099-07-01 14:00:00','ZZPOSOM-B','ZZ party','ZZLED01','N','$PosUser','2099-07-01 14:00:00',200,'');
+
+INSERT INTO ordercanceldetails (OrderCancelDetailsId,OrderCancelMasterId,OrderDetailsId,InventoryDetailsId,UnitId,Quantity,Rate,TotalAmount,Description,CreatedByUser,CreatedTimeStamp)
+VALUES (970201,'ZZPOSOC-1',970102,'$PosInv','ZZU',1,100,100,'ZZ cancel B','$PosUser','2099-07-01 14:00:00'),
+       (970202,'ZZPOSOC-1',970103,'$PosInv','ZZU',1,100,100,'ZZ cancel C','$PosUser','2099-07-01 14:00:00');
+
+INSERT INTO salemaster (AUTOID,OrganizationCode,BillTypeId,OrderMasterId,LedgerId,PartyDetails,VoucherDate,Status,GrossAmount,TaxId,TaxableAmount,TaxPercentage,TaxAmount,DiscountPercentage,DiscountAmount,RoundOffAmount,TotalAmount,PaidAmount,CreatedByUser,CreatedTimeStamp,SaleMasterId,VoucherNumber,Description,PosMode,IsOut)
+VALUES (970006,'ZZ01','$PosBill','ZZPOSOM-A,ZZPOSOM-X','ZZLED01','ZZ party','2099-07-02 09:00:00','N',300,'ZZTAX',300,0,0,0,0,0,300,300,'$PosUser','2099-07-02 09:00:00','ZZPOSSM-1','ZZPOSVN-1','ZZ merged bill','counter',0),
+       (970007,'ZZ01','$PosBill','','ZZLED01','ZZ party','2099-07-02 10:00:00','N',100,'ZZTAX',100,0,0,0,0,0,100,100,'$PosUser','2099-07-02 10:00:00','ZZPOSSM-2','ZZPOSVN-2','ZZ blank orderid','parcel',1),
+       (970008,'ZZ01','$PosBill',NULL,'ZZLED01','ZZ party','2099-07-02 11:00:00','N',50,'ZZTAX',50,0,0,0,0,0,50,0,'$PosUser','2099-07-02 11:00:00','ZZPOSSM-3','ZZPOSVN-3','ZZ unpaid',NULL,0);
+
+INSERT INTO salesdetails (SaleMasterId,InventoryDetailsId,UnitId,Quantity,Rate,GrossAmount,DiscountPercentage,DiscountAmount,TaxId,TaxableAmount,TaxPercentage,TaxAmount,TotalAmount,CreatedByUser,CreatedTimeStamp,Description,AddTaxId,AddTaxPercentage,AddTaxAmount,AddTaxId1,AddTaxPercentage1,AddTaxAmount1)
+VALUES ('ZZPOSSM-1','$PosInv','ZZU',3,100,300,0,0,'ZZTAX',300,0,0,300,'$PosUser','2099-07-02 09:00:00','ZZ sale line','ZZAT',0,0,'ZZAT1',0,0);
+"@
+    Invoke-MysqlFile $sql
+    # MySQL's backticked `user` becomes PostgreSQL's quoted "user" first, so the
+    # column-list rewrite below only has to cope with one quoting style.
+    $pg = $sql -replace '`user`', '"user"'
+    $pg = [regex]::Replace($pg, '(?m)^INSERT INTO ("?\w+"?) \(([^)]*)\)', {
+        param($m)
+        $cols = ($m.Groups[2].Value -split ',' | ForEach-Object { '"' + $_.Trim() + '"' }) -join ','
+        "INSERT INTO $($m.Groups[1].Value) ($cols)"
+    })
+    Invoke-Psql -Quiet $pg
+}
+
+<#
+    Puts a write endpoint's number series into a known, identical state.
+
+    MaxId is derived from billtype.StartNumber and MAX(AUTOID) over live rows,
+    so without this the two servers mint different ids and voucher numbers and
+    every write case fails for an uninteresting reason. Deleting all ZZ masters
+    makes MAX(AUTOID) NULL on both sides, which collapses MaxId to StartNumber
+    alone. Must run before EVERY write case, not once per section.
+#>
+function Reset-WriteSeries {
+    param([string]$BillTypeId, [int]$Start, [string]$Prefix = '', [string]$Suffix = '')
+    $sql = @"
+DELETE FROM orderdetails       WHERE ordermstr_id        LIKE '$BillTypeId-%';
+DELETE FROM ordercanceldetails WHERE OrderCancelMasterId LIKE '$BillTypeId-%';
+DELETE FROM salesdetails       WHERE SaleMasterId        LIKE '$BillTypeId-%';
+DELETE FROM pdcdetails         WHERE ReferenceId         LIKE '$BillTypeId-%';
+DELETE FROM ordermaster        WHERE BillTypeId = '$BillTypeId';
+DELETE FROM ordercancelmaster  WHERE BillTypeId = '$BillTypeId';
+DELETE FROM salemaster         WHERE BillTypeId = '$BillTypeId';
+DELETE FROM billtype           WHERE BillTypeId = '$BillTypeId';
+INSERT INTO billtype (OrganizationCode,BillTypeId,BillTypeName,StartNumber,Prefix,Suffix,VoucherType,TaxType,CreatedByUser)
+VALUES ('ZZ01','$BillTypeId','ZZ Write BT',$Start,'$Prefix','$Suffix','SO','','$PosUser');
+"@
+    Invoke-MysqlFile $sql
+    $pg = ($sql -replace '(?m)WHERE (\w+)', 'WHERE "$1"')
+    $pg = [regex]::Replace($pg, '(?m)^INSERT INTO (\w+) \(([^)]*)\)', {
+        param($m)
+        $cols = ($m.Groups[2].Value -split ',' | ForEach-Object { '"' + $_.Trim() + '"' }) -join ','
+        "INSERT INTO $($m.Groups[1].Value) ($cols)"
+    })
+    Invoke-Psql -Quiet $pg
+}
+
+Reset-PosRows
+Seed-PosRows
+
+# --- 93-100. Reads with no filter: zero-row envelope, then key shape ----------
+#
+# The zero-row cases are the interesting half. DATA is the *string* "EMPTY" and
+# STATUS is ERROR -- unlike the sync loop's reads, where an empty result is
+# DATA: null with STATUS SUCCESS.
+Compare-Case -Name '93. get_ledgers (key shape on live data)' -Body @{ api = 'get_ledgers' } -Mode 'Keys'
+Compare-Case -Name '94. get_ledgersbyname (no match -> "EMPTY")' -Body @{ api = 'get_ledgersbyname'; Searchstring = 'ZZNOSUCHLEDGER'; UserId = 'ZZNOBODY'; RoutId = '' }
+Compare-Case -Name '95. get_ledgersbyname (key shape, blank search)' -Body @{ api = 'get_ledgersbyname'; Searchstring = ''; UserId = 'ZZNOBODY'; RoutId = '' } -Mode 'Keys'
+Compare-Case -Name '96. get_ledgersbyname (RoutId branch)' -Body @{ api = 'get_ledgersbyname'; Searchstring = 'ZZNOSUCHLEDGER'; UserId = 'ZZNOBODY'; RoutId = 'ZZR' }
+Compare-Case -Name '97. get_bankdetails (key shape)' -Body @{ api = 'get_bankdetails'; UserId = 'ZZNOBODY' } -Mode 'Keys'
+Compare-Case -Name '98. get_userviewprivileges (no match -> "DATA NOT FOUND !!")' -Body @{ api = 'get_userviewprivileges'; UserId = 'ZZNOBODY'; ViewName = 'ZZNOVIEW' }
+Compare-Case -Name '99. get_stock (no rows -> [] and the generic error)' -Body @{ api = 'get_stock'; OrganizationCode = 'ZZNOSUCHORG'; WarehouseId = '' }
+Compare-Case -Name '100. get_product_with_category_withstock (no rows -> [])' -Body @{ api = 'get_product_with_category_withstock'; OrganizationCode = 'ZZNOSUCHORG'; WarehouseId = '' }
+
+# --- 101-105. The catalogue, on the seeded ZZ01 category ----------------------
+#
+# 102/103 are byte-comparable because the fixture is identical on both sides,
+# and they are what proves the COALESCE scale fix: the product joins no
+# taxdetails row and has no warehousestock, so TaxPercentage and Stock take
+# their NULL branch. MySQL prints "0.000"/"0.00000000" there; an untyped
+# PostgreSQL zero literal would print "0".
+Compare-Case -Name '101. get_organization (image URLs from settings)' -Body @{ api = 'get_organization' }
+Compare-Case -Name '102. get_product_with_category_withstock (no WarehouseId)' -Body @{ api = 'get_product_with_category_withstock'; OrganizationCode = 'ZZ01'; WarehouseId = '' }
+Compare-Case -Name '103. ... with WarehouseId (drops UnitShortName)' -Body @{ api = 'get_product_with_category_withstock'; OrganizationCode = 'ZZ01'; WarehouseId = 'ZZWH' }
+Compare-Case -Name '104. ... product key shape, no WarehouseId' -Body @{ api = 'get_product_with_category_withstock'; OrganizationCode = 'ZZ01'; WarehouseId = '' } -Mode 'Keys' -KeyPath 'products'
+Compare-Case -Name '105. ... product key shape, WarehouseId' -Body @{ api = 'get_product_with_category_withstock'; OrganizationCode = 'ZZ01'; WarehouseId = 'ZZWH' } -Mode 'Keys' -KeyPath 'products'
+
+# --- 106-108. The image base URL -------------------------------------------
+#
+# Both stacks resolve to http://localhost:8090 today for DIFFERENT reasons --
+# MySQL has the settings row, PostgreSQL falls back to the hardcoded default --
+# so a broken parser would still pass. Pinning a non-default host WITH an
+# explicit port exercises the whole parse_url path.
+$origApiUrl = (& $Mysql -u root fireflydb -N -B -e "SELECT ``value`` FROM settings_common WHERE ``key``='firefly_api_url';" 2>$null | Select-Object -First 1)
+try {
+    Set-SettingsKey -Key 'firefly_api_url' -Value 'https://zz.example.test:9443/ffapi/firefly_api.php'
+    Compare-Case -Name '106. get_organization (custom host and port)' -Body @{ api = 'get_organization' }
+
+    # parse_url yields no scheme+host, and PHP then returns '' rather than the
+    # fallback -- so every path becomes a bare /ffapi/Org_Image/.
+    Set-SettingsKey -Key 'firefly_api_url' -Value 'not a url'
+    Compare-Case -Name '107. get_organization (unparseable URL -> site-relative)' -Body @{ api = 'get_organization' }
+
+    Remove-SettingsKey -Key 'firefly_api_url'
+    Compare-Case -Name '108. get_organization (setting absent -> fallback)' -Body @{ api = 'get_organization' }
+} finally {
+    if ($origApiUrl) { Set-SettingsKey -Key 'firefly_api_url' -Value $origApiUrl }
+    else             { Remove-SettingsKey -Key 'firefly_api_url' }
+}
+
+# --- 109-116. The 2099 window: order and sale reads --------------------------
+$W = @{ FromDate = '2099-01-01'; TillDate = '2099-12-31' }
+
+# 'Set' rather than 'Bytes': this query has no ORDER BY, unlike its _test
+# siblings, so the two engines return the same rows in a different sequence.
+Compare-Case -Name '109. get_allnoncommitedordermaster (no ORDER BY)' -Body @{ api = 'get_allnoncommitedordermaster'; BillTypeId = $PosBill; FromDate = $W.FromDate; TillDate = $W.TillDate } -Mode 'Set'
+Compare-Case -Name '110. get_allnoncommitedordermaster_test (cancel maths)' -Body @{ api = 'get_allnoncommitedordermaster_test'; BillTypeId = $PosBill; FromDate = $W.FromDate; TillDate = $W.TillDate }
+Compare-Case -Name '111. get_allnoncommitedordermaster_test2 (all billtypes)' -Body @{ api = 'get_allnoncommitedordermaster_test2'; FromDate = $W.FromDate; TillDate = $W.TillDate }
+Compare-Case -Name '112. get_ordermasterbynumber' -Body @{ api = 'get_ordermasterbynumber'; BillTypeId = $PosBill; OrderNumber = 'ZZPOSON-B' }
+Compare-Case -Name '113. get_ordermasterbynumber_test (PARTIAL)' -Body @{ api = 'get_ordermasterbynumber_test'; BillTypeId = $PosBill; OrderNumber = 'ZZPOSON-B' }
+Compare-Case -Name '114. get_ordermasterbynumber_test (FULL)' -Body @{ api = 'get_ordermasterbynumber_test'; BillTypeId = $PosBill; OrderNumber = 'ZZPOSON-C' }
+# The one case that reaches the zero-row COALESCE branch on all four computed
+# columns: an order with no lines at all, which the list endpoints filter out.
+Compare-Case -Name '115. get_ordermasterbynumber_test (no lines -> 0.00000000 / 0.0000000000000000)' -Body @{ api = 'get_ordermasterbynumber_test'; BillTypeId = $PosBill; OrderNumber = 'ZZPOSON-D' }
+Compare-Case -Name '116. get_ordermasterbynumber (unknown number -> "EMPTY")' -Body @{ api = 'get_ordermasterbynumber'; BillTypeId = $PosBill; OrderNumber = 'ZZNOSUCH' }
+
+Compare-Case -Name '117. get_allorderDetailsByMasterId' -Body @{ api = 'get_allorderDetailsByMasterId'; OrderMasterId = 'ZZPOSOM-B' }
+Compare-Case -Name '118. get_allorderDetailsByMasterId_test (net of cancellations)' -Body @{ api = 'get_allorderDetailsByMasterId_test'; OrderMasterId = 'ZZPOSOM-B' }
+# Every line cancelled, so the HAVING/outer-WHERE filter empties the result.
+Compare-Case -Name '119. get_allorderDetailsByMasterId_test (fully cancelled -> [])' -Body @{ api = 'get_allorderDetailsByMasterId_test'; OrderMasterId = 'ZZPOSOM-C' }
+Compare-Case -Name '120. get_allorderDetailsByMasterId (no lines -> [])' -Body @{ api = 'get_allorderDetailsByMasterId'; OrderMasterId = 'ZZPOSOM-D' }
+
+# Also no ORDER BY. 122 and 123 return a single row each, so they stay 'Bytes'.
+Compare-Case -Name '121. get_allsales (PosMode + IsOut, no ORDER BY)' -Body @{ api = 'get_allsales'; FromDate = $W.FromDate; TillDate = $W.TillDate } -Mode 'Set'
+Compare-Case -Name '122. get_allsaleswithoutpaidamount (PaidAmount = 0 only)' -Body @{ api = 'get_allsaleswithoutpaidamount'; FromDate = $W.FromDate; TillDate = $W.TillDate }
+Compare-Case -Name '123. get_salemasterbyNumber' -Body @{ api = 'get_salemasterbyNumber'; BillTypeId = $PosBill; VoucherNumber = 'ZZPOSVN-1' }
+Compare-Case -Name '124. get_allsaleDetailsByMasterId' -Body @{ api = 'get_allsaleDetailsByMasterId'; SaleMasterId = 'ZZPOSSM-1' }
+Compare-Case -Name '125. get_allsaleDetailsByMasterId (no lines -> [])' -Body @{ api = 'get_allsaleDetailsByMasterId'; SaleMasterId = 'ZZPOSSM-3' }
+
+# --- 126+. The writes --------------------------------------------------------
+#
+# All three open with SELECT ... FROM organization LIMIT 1, unordered. Its
+# OrganizationCode is stored on every row they write and its
+# UseBackSlashAsInvSeparator decides whether voucher numbers use '-' or '/',
+# which IS on the wire. If the two databases disagree there, every comparison
+# below is meaningless -- so say so plainly rather than emit a wall of diffs.
+$myOrg = (& $Mysql -u root fireflydb -N -B -e "SELECT CONCAT(OrganizationCode,'/',UseBackSlashAsInvSeparator) FROM organization LIMIT 1;" 2>$null | Select-Object -First 1)
+$pgOrg = Get-PgScalar "SELECT `"OrganizationCode`" || '/' || `"UseBackSlashAsInvSeparator`" FROM organization LIMIT 1;"
+
+if ($myOrg -ne $pgOrg) {
+    $script:Fail++
+    Write-Host "FAIL  126-140. write cases SKIPPED -- organization LIMIT 1 differs" -ForegroundColor Red
+    Write-Host "      mysql: $myOrg    postgres: $pgOrg" -ForegroundColor Yellow
+    Write-Host "      Both writes stamp OrganizationCode onto every row and take the" -ForegroundColor Yellow
+    Write-Host "      voucher separator from UseBackSlashAsInvSeparator, so give" -ForegroundColor Yellow
+    Write-Host "      fireflydb_test a matching organization row and re-run." -ForegroundColor Yellow
+} else {
+    $orderDetails = '[{"InventoryDetailsId":"' + $PosInv + '","Quantity":"2","Rate":"100","DetailsTotalAmount":"200","Description":"ZZ line"}]'
+
+    function New-OrderBody {
+        # $Details is deliberately untyped: PowerShell coerces $null to '' for a
+        # [string] parameter, so a typed default would silently send an empty
+        # payload and every case below would exercise the no-lines path instead.
+        param([string]$MasterId = '', [string]$Chair = '2', [string]$PosMode = 'counter', $Details = $null)
+        if ($null -eq $Details) { $Details = $orderDetails }
+        return @{
+            api = 'insert_orderbybilltype'; OrderMasterId = $MasterId
+            OrderDate = '2099-07-05 09:00:00'; LedgerId = 'ZZLED01'; PartyDetails = 'ZZ party'
+            NoofChair = $Chair; CreatedByUser = $PosUser; TotalAmount = '200.00'
+            BillTypeId = $PosWBill; Description = ''; CreatedTimeStamp = '2099-07-05 09:00:00'
+            PosMode = $PosMode; OrderDetails = $Details
+        }
+    }
+
+    Reset-WriteSeries -BillTypeId $PosWBill -Start 500 -Prefix 'KOT' -Suffix '26'
+    Compare-Case -Name '126. insert_orderbybilltype (INSERT -> id + voucherNumber)' -Body (New-OrderBody)
+    # The response says nothing about the lines, so check them directly --
+    # including UnitId, which the endpoint looks up from product rather than
+    # taking from the payload.
+    $myOrdDet = Get-MysqlRows "SELECT ordermstr_id,InventoryDetailsId,UnitId,Quantity,Rate,TotalAmount,Description FROM orderdetails WHERE ordermstr_id LIKE '$PosWBill-%' ORDER BY orderdtl_id;"
+    $pgOrdDet = Get-PgRows "SELECT `"ordermstr_id`",`"InventoryDetailsId`",`"UnitId`",`"Quantity`",`"Rate`",`"TotalAmount`",`"Description`" FROM orderdetails WHERE `"ordermstr_id`" LIKE '$PosWBill-%' ORDER BY `"orderdtl_id`";"
+    Assert-SameRows -Name '126a. stored orderdetails (UnitId resolved from product)' -Mysql $myOrdDet -Postgres $pgOrdDet
+
+    # The UPDATE path answers id="" and voucherNumber="": both are only assigned
+    # inside the INSERT branch (firefly_api.php 7783).
+    # The UPDATE path, plus what it leaves behind. Each side's rows are captured
+    # right after its own run, because the reset in between clears both.
+    $updBody   = New-OrderBody -MasterId "$PosWBill-0000000500" -Chair '4' -PosMode ''
+    $myOrderQ  = "SELECT AUTOID,OrderMasterId,OrderNumber,NoofChair,Status,TotalAmount,PosMode FROM ordermaster WHERE BillTypeId='$PosWBill';"
+    $pgOrderQ  = "SELECT `"AUTOID`",`"OrderMasterId`",`"OrderNumber`",`"NoofChair`",`"Status`",`"TotalAmount`",`"PosMode`" FROM ordermaster WHERE `"BillTypeId`" = '$PosWBill';"
+
+    Reset-WriteSeries -BillTypeId $PosWBill -Start 500 -Prefix 'KOT' -Suffix '26'
+    Invoke-Endpoint -Url $PhpUrl -Body (New-OrderBody) | Out-Null
+    $phpUpd   = Invoke-Endpoint -Url $PhpUrl -Body $updBody
+    $myStored = Get-MysqlRows $myOrderQ
+
+    Reset-WriteSeries -BillTypeId $PosWBill -Start 500 -Prefix 'KOT' -Suffix '26'
+    Invoke-Endpoint -Url $NextUrl -Body (New-OrderBody) | Out-Null
+    $nextUpd  = Invoke-Endpoint -Url $NextUrl -Body $updBody
+    $pgStored = Get-PgRows $pgOrderQ
+
+    if ($phpUpd.Body -ceq $nextUpd.Body) {
+        $script:Pass++; Write-Host "PASS  127. insert_orderbybilltype (UPDATE -> empty id/voucherNumber)" -ForegroundColor Green
+        Write-Host "      $($phpUpd.Body)" -ForegroundColor DarkGray
+    } else {
+        $script:Fail++; Write-Host "FAIL  127. insert_orderbybilltype (UPDATE)" -ForegroundColor Red
+        Write-Host "      PHP  $($phpUpd.Body)" -ForegroundColor Yellow
+        Write-Host "      NEXT $($nextUpd.Body)" -ForegroundColor Cyan
+    }
+    # PosMode='' must PRESERVE 'counter' via COALESCE(NULLIF(...)); NoofChair 4.
+    Assert-SameRows -Name "128. stored ordermaster after the UPDATE (PosMode preserved)" -Mysql $myStored -Postgres $pgStored
+
+    # int(11) via mysqlInt: MySQL ROUNDS, half away from zero -- 2.5 -> 3.
+    Reset-WriteSeries -BillTypeId $PosWBill -Start 500 -Prefix 'KOT' -Suffix '26'
+    Compare-Case -Name '129. insert_orderbybilltype (NoofChair "2.5")' -Body (New-OrderBody -Chair '2.5')
+    $myChair = Get-MysqlRows "SELECT NoofChair FROM ordermaster WHERE BillTypeId='$PosWBill';"
+    $pgChair = Get-PgRows "SELECT `"NoofChair`" FROM ordermaster WHERE `"BillTypeId`" = '$PosWBill';"
+    Assert-SameRows -Name '129a. stored NoofChair must be 3 on both' -Mysql $myChair -Postgres $pgChair
+
+    # A missing OrderDate hits a NOT NULL column: both fail, each with its own
+    # driver's wording, and the whole transaction rolls back.
+    Reset-WriteSeries -BillTypeId $PosWBill -Start 500 -Prefix 'KOT' -Suffix '26'
+    $noDate = New-OrderBody; $noDate.Remove('OrderDate')
+    Compare-Case -Name '130. insert_orderbybilltype (missing OrderDate -> rollback)' -Body $noDate
+
+    # --- insert_ordercancelbybilltype ---------------------------------------
+    $cancelDetails = '[{"InventoryDetailsId":"' + $PosInv + '","OrderDetailsId":970102,"Quantity":"1","Rate":"100","DetailsTotalAmount":"100","Description":"ZZ cancel"}]'
+
+    function New-CancelBody {
+        # Untyped $Details -- see New-OrderBody.
+        param([string]$MasterId = '', $Details = $null)
+        if ($null -eq $Details) { $Details = $cancelDetails }
+        return @{
+            api = 'insert_ordercancelbybilltype'; OrderCancelMasterId = $MasterId
+            OrderMasterId = 'ZZPOSOM-B'; OrderCancelDate = '2099-07-06 09:00:00'
+            LedgerId = 'ZZLED01'; PartyDetails = 'ZZ party'; CreatedByUser = $PosUser
+            TotalAmount = '100.00'; BillTypeId = $PosCBill; Description = ''
+            CreatedTimeStamp = '2099-07-06 09:00:00'; OrderCancelDetails = $Details
+        }
+    }
+
+    # StartNumber 0 must become 1 -- this endpoint's empty() rule, unlike the
+    # sale insert's is_null.
+    Reset-WriteSeries -BillTypeId $PosCBill -Start 0
+    Compare-Case -Name '131. insert_ordercancelbybilltype (StartNumber 0 -> 1)' -Body (New-CancelBody)
+
+    Reset-WriteSeries -BillTypeId $PosCBill -Start 1
+    Invoke-Endpoint -Url $PhpUrl -Body (New-CancelBody) | Out-Null
+    $phpSecond = Invoke-Endpoint -Url $PhpUrl -Body (New-CancelBody)
+    Reset-WriteSeries -BillTypeId $PosCBill -Start 1
+    Invoke-Endpoint -Url $NextUrl -Body (New-CancelBody) | Out-Null
+    $nextSecond = Invoke-Endpoint -Url $NextUrl -Body (New-CancelBody)
+    if ($phpSecond.Body -ceq $nextSecond.Body) {
+        $script:Pass++; Write-Host "PASS  132. insert_ordercancelbybilltype (id collision -> MAX(AUTOID)+1)" -ForegroundColor Green
+        Write-Host "      $($phpSecond.Body)" -ForegroundColor DarkGray
+    } else {
+        $script:Fail++; Write-Host "FAIL  132. insert_ordercancelbybilltype (id collision)" -ForegroundColor Red
+        Write-Host "      PHP  $($phpSecond.Body)" -ForegroundColor Yellow
+        Write-Host "      NEXT $($nextSecond.Body)" -ForegroundColor Cyan
+    }
+
+    # OrderDetailsId omitted: PHP defaults it to '' and MySQL coerces that to 0
+    # in the int column. mysqlInt reproduces it.
+    Reset-WriteSeries -BillTypeId $PosCBill -Start 1
+    $noDetailId = '[{"InventoryDetailsId":"' + $PosInv + '","Quantity":"1","Rate":"100","DetailsTotalAmount":"100","Description":"ZZ"}]'
+    Compare-Case -Name '133. insert_ordercancelbybilltype (OrderDetailsId omitted)' -Body (New-CancelBody -Details $noDetailId)
+    # Both sides ran against the same series with no reset between, so a single
+    # capture of each is enough. OrderDetailsId must be 0 -- PHP defaults it to
+    # '' and MySQL coerces that in the int column -- and UnitId must have been
+    # looked up from product because the payload omitted it.
+    $myCancelDet = Get-MysqlRows "SELECT OrderDetailsId,UnitId,Quantity FROM ordercanceldetails WHERE OrderCancelMasterId LIKE '$PosCBill-%';"
+    $pgCancelDet = Get-PgRows "SELECT `"OrderDetailsId`",`"UnitId`",`"Quantity`" FROM ordercanceldetails WHERE `"OrderCancelMasterId`" LIKE '$PosCBill-%';"
+    Assert-SameRows -Name '133a. stored ordercanceldetails (OrderDetailsId 0, UnitId from product)' -Mysql $myCancelDet -Postgres $pgCancelDet
+
+    # The only one of the three whose app-level error text is identical on both
+    # stacks, because the message is thrown by the handler, not the driver.
+    Reset-WriteSeries -BillTypeId $PosCBill -Start 1
+    Compare-Case -Name '134. insert_ordercancelbybilltype (malformed JSON)' -Body (New-CancelBody -Details 'not json')
+
+    # --- insert_salebybilltypewithpdc ---------------------------------------
+    $saleDetails = '[{"InventoryDetailsId":"' + $PosInv + '","Rate":"100","Quantity":"2","DetailsGrossAmount":"200","DetailsTaxId":"ZZTAX","DetailsTaxableAmount":"200","DetailsTaxPercentage":"0","DetailsTaxAmount":"0","DetailsAddTaxId":"","DetailsAddTaxPercentage":"0","DetailsAddTaxAmount":"0","DetailsAddTaxId1":"","DetailsAddTaxPercentage1":"0","DetailsAddTaxAmount1":"0","DetailsDiscountPercentage":"0","DetailsDiscountAmount":"0","DetailsTotalAmount":"200","DetailsDescription":"ZZ sale line"}]'
+    # Verbatim from logs\api_2026-07-31.log: the ERP sends one all-blank element
+    # on every sale, cheque or not. This is what makes ChequeDate '0000-00-00'.
+    $pdcBlank = '[{"BankLedgerId":"","Amount":"","PaymentMode":"","ChequeNumber":"","ChequeDate":""}]'
+    $pdcReal  = '[{"BankLedgerId":"ZZBANK","Amount":"150.50","PaymentMode":"PC","ChequeNumber":"ZZCHQ9","ChequeDate":"2099-08-15"}]'
+
+    function New-SaleBody {
+        param([string]$MasterId = '', [string]$Orders = 'ZZPOSOM-D', [string]$RoundOff = '0.00',
+              [string]$Idem = '', $Pdc = $null)   # untyped -- see New-OrderBody
+        if ($null -eq $Pdc) { $Pdc = $pdcBlank }
+        return @{
+            api = 'insert_salebybilltypewithpdc'; SaleMasterId = $MasterId
+            VoucherDate = '2099-07-07 09:00:00'; LedgerId = 'ZZLED01'; PartyDetails = 'ZZ party'
+            CreatedByUser = $PosUser; OrderMasterId = $Orders
+            GrossAmount = '200'; TaxId = 'ZZTAX'; TaxableAmount = '200'; TaxPercentage = '0'
+            TaxAmount = '0'; DiscountPercentage = '0'; DiscountAmount = '0'
+            TotalAmount = '200'; PaidAmount = '200'; BillTypeId = $PosSBill; Description = ''
+            RoundOffAmount = $RoundOff; CreatedTimeStamp = '2099-07-07 09:00:00'; PosMode = 'counter'
+            SaleDetails = $saleDetails; PdcDetails = $Pdc; IdempotencyKey = $Idem
+        }
+    }
+
+    Reset-WriteSeries -BillTypeId $PosSBill -Start 700 -Prefix '26-27KPY'
+    Compare-Case -Name '135. insert_salebybilltypewithpdc (INSERT)' -Body (New-SaleBody)
+    # 22 columns per line, every one of them bound from a differently-named
+    # payload key (Rate -> Rate, but DetailsGrossAmount -> GrossAmount and so
+    # on), which is exactly where a transcription slip would hide.
+    $mySaleDet = Get-MysqlRows "SELECT InventoryDetailsId,UnitId,Quantity,Rate,GrossAmount,TaxId,TaxableAmount,TaxPercentage,TaxAmount,AddTaxId,AddTaxPercentage,AddTaxAmount,AddTaxId1,AddTaxPercentage1,AddTaxAmount1,DiscountPercentage,DiscountAmount,TotalAmount,Description FROM salesdetails WHERE SaleMasterId LIKE '$PosSBill-%' ORDER BY SaleDetailsId;"
+    $pgSaleDet = Get-PgRows "SELECT `"InventoryDetailsId`",`"UnitId`",`"Quantity`",`"Rate`",`"GrossAmount`",`"TaxId`",`"TaxableAmount`",`"TaxPercentage`",`"TaxAmount`",`"AddTaxId`",`"AddTaxPercentage`",`"AddTaxAmount`",`"AddTaxId1`",`"AddTaxPercentage1`",`"AddTaxAmount1`",`"DiscountPercentage`",`"DiscountAmount`",`"TotalAmount`",`"Description`" FROM salesdetails WHERE `"SaleMasterId`" LIKE '$PosSBill-%' ORDER BY `"SaleDetailsId`";"
+    Assert-SameRows -Name '135a. stored salesdetails (all 19 value columns)' -Mysql $mySaleDet -Postgres $pgSaleDet
+
+    Reset-WriteSeries -BillTypeId $PosSBill -Start 700 -Prefix '26-27KPY'
+    Compare-Case -Name '136. ... RoundOffAmount "" on INSERT -> 0.00' -Body (New-SaleBody -RoundOff '')
+
+    Reset-WriteSeries -BillTypeId $PosSBill -Start 700 -Prefix '26-27KPY'
+    Compare-Case -Name '137. ... with IdempotencyKey' -Body (New-SaleBody -Idem 'ZZIDEM-1')
+
+    # Layer 2 of the idempotency guard: the replay must return the SAME id with
+    # a fourth key, "duplicate":true, and must not mint a second invoice.
+    Reset-WriteSeries -BillTypeId $PosSBill -Start 700 -Prefix '26-27KPY'
+    Invoke-Endpoint -Url $PhpUrl -Body (New-SaleBody -Idem 'ZZIDEM-1') | Out-Null
+    $phpDup = Invoke-Endpoint -Url $PhpUrl -Body (New-SaleBody -Idem 'ZZIDEM-1')
+    Reset-WriteSeries -BillTypeId $PosSBill -Start 700 -Prefix '26-27KPY'
+    Invoke-Endpoint -Url $NextUrl -Body (New-SaleBody -Idem 'ZZIDEM-1') | Out-Null
+    $nextDup = Invoke-Endpoint -Url $NextUrl -Body (New-SaleBody -Idem 'ZZIDEM-1')
+    if ($phpDup.Body -ceq $nextDup.Body) {
+        $script:Pass++; Write-Host 'PASS  138. ... replayed IdempotencyKey -> "duplicate":true' -ForegroundColor Green
+        Write-Host "      $($phpDup.Body)" -ForegroundColor DarkGray
+    } else {
+        $script:Fail++; Write-Host 'FAIL  138. ... replayed IdempotencyKey' -ForegroundColor Red
+        Write-Host "      PHP  $($phpDup.Body)" -ForegroundColor Yellow
+        Write-Host "      NEXT $($nextDup.Body)" -ForegroundColor Cyan
+    }
+
+    # Same guard reached the other way: no key, but the orders are already billed.
+    Reset-WriteSeries -BillTypeId $PosSBill -Start 700 -Prefix '26-27KPY'
+    Invoke-Endpoint -Url $PhpUrl -Body (New-SaleBody) | Out-Null
+    $phpDup2 = Invoke-Endpoint -Url $PhpUrl -Body (New-SaleBody)
+    Reset-WriteSeries -BillTypeId $PosSBill -Start 700 -Prefix '26-27KPY'
+    Invoke-Endpoint -Url $NextUrl -Body (New-SaleBody) | Out-Null
+    $nextDup2 = Invoke-Endpoint -Url $NextUrl -Body (New-SaleBody)
+    if ($phpDup2.Body -ceq $nextDup2.Body) {
+        $script:Pass++; Write-Host 'PASS  139. ... replayed OrderMasterId -> "duplicate":true' -ForegroundColor Green
+        Write-Host "      $($phpDup2.Body)" -ForegroundColor DarkGray
+    } else {
+        $script:Fail++; Write-Host 'FAIL  139. ... replayed OrderMasterId' -ForegroundColor Red
+        Write-Host "      PHP  $($phpDup2.Body)" -ForegroundColor Yellow
+        Write-Host "      NEXT $($nextDup2.Body)" -ForegroundColor Cyan
+    }
+
+    <#
+        140-141. The UPDATE path, and the cheque rows it rewrites.
+
+        Both scenarios run in one pass per host so each side's rows can be
+        captured before the reset that precedes the other host's run.
+
+        141 is the case the pdcdetails.ChequeDate decision exists for. The ERP
+        posts ChequeDate="" on every sale; non-strict MySQL coerces that into
+        its DATE column as '0000-00-00', which PostgreSQL's date type cannot
+        represent at all -- so the column is varchar(10) here and mysqlDate()
+        reproduces the coercion. Both sides must store [0000-00-00], alongside a
+        real cheque date that must survive unchanged.
+
+        Both cheques go in ONE payload on purpose: the UPDATE path deletes
+        pdcdetails by ReferenceId before rewriting them, so sending them in two
+        calls would leave only the second.
+
+        AUTOID and the ids derived from it (PDCDetailsId, PDCNumber) are NOT
+        compared. They come from MAX(AUTOID)+1 over every pdcdetails row sharing
+        that PaymentMode, and live MySQL holds 31 legacy rows with a blank mode
+        where fireflydb_test holds none -- a data difference, not a behavioural
+        one. What IS compared is PaymentMode, Amount, Type, ChequeDate and
+        Status, bracketed so an empty string is visible.
+    #>
+    $bothCheques = '[' +
+        '{"BankLedgerId":"","Amount":"","PaymentMode":"","ChequeNumber":"","ChequeDate":""},' +
+        '{"BankLedgerId":"ZZBANK01","Amount":"150.50","PaymentMode":"PC","ChequeNumber":"ZZCHQ9","ChequeDate":"2099-08-15"}' +
+        ']'
+    $mySaleQ = "SELECT SaleMasterId,VoucherNumber,RoundOffAmount,Status,PosMode FROM salemaster WHERE BillTypeId='$PosSBill';"
+    $pgSaleQ = "SELECT `"SaleMasterId`",`"VoucherNumber`",`"RoundOffAmount`",`"Status`",`"PosMode`" FROM salemaster WHERE `"BillTypeId`" = '$PosSBill';"
+    $myPdcQ  = "SELECT CONCAT('[',PaymentMode,']'),Amount,Type,CONCAT('[',CAST(ChequeDate AS CHAR),']'),CONCAT('[',ChequeNumber,']'),Status FROM pdcdetails WHERE ReferenceId LIKE '$PosSBill-%' ORDER BY PaymentMode;"
+    $pgPdcQ  = "SELECT '['||`"PaymentMode`"||']',`"Amount`",`"Type`",'['||`"ChequeDate`"||']','['||`"ChequeNumber`"||']',`"Status`" FROM pdcdetails WHERE `"ReferenceId`" LIKE '$PosSBill-%' ORDER BY `"PaymentMode`";"
+
+    Reset-WriteSeries -BillTypeId $PosSBill -Start 700 -Prefix '26-27KPY'
+    Invoke-Endpoint -Url $PhpUrl -Body (New-SaleBody -RoundOff '1.25' -Pdc $bothCheques) | Out-Null
+    $phpSaleUpd = Invoke-Endpoint -Url $PhpUrl -Body (New-SaleBody -MasterId "$PosSBill-0000000700" -RoundOff '' -Pdc $bothCheques)
+    $mySaleRows = Get-MysqlRows $mySaleQ
+    $myPdcRows  = Get-MysqlRows $myPdcQ
+
+    Reset-WriteSeries -BillTypeId $PosSBill -Start 700 -Prefix '26-27KPY'
+    Invoke-Endpoint -Url $NextUrl -Body (New-SaleBody -RoundOff '1.25' -Pdc $bothCheques) | Out-Null
+    $nextSaleUpd = Invoke-Endpoint -Url $NextUrl -Body (New-SaleBody -MasterId "$PosSBill-0000000700" -RoundOff '' -Pdc $bothCheques)
+    $pgSaleRows = Get-PgRows $pgSaleQ
+    $pgPdcRows  = Get-PgRows $pgPdcQ
+
+    if ($phpSaleUpd.Body -ceq $nextSaleUpd.Body) {
+        $script:Pass++; Write-Host 'PASS  140. ... UPDATE path' -ForegroundColor Green
+        Write-Host "      $($phpSaleUpd.Body)" -ForegroundColor DarkGray
+    } else {
+        $script:Fail++; Write-Host 'FAIL  140. ... UPDATE path' -ForegroundColor Red
+        Write-Host "      PHP  $($phpSaleUpd.Body)" -ForegroundColor Yellow
+        Write-Host "      NEXT $($nextSaleUpd.Body)" -ForegroundColor Cyan
+    }
+    # RoundOffAmount was omitted on the update, so 1.25 must have survived.
+    Assert-SameRows -Name '140a. stored salemaster (RoundOffAmount preserved as 1.25)' -Mysql $mySaleRows -Postgres $pgSaleRows
+    Assert-SameRows -Name '141. stored pdcdetails (ChequeDate 0000-00-00 and 2099-08-15)' -Mysql $myPdcRows -Postgres $pgPdcRows
+
+    <#
+        142. Blank date into a datetime column. KNOWN DIVERGENCE, not asserted.
+
+        insert_ordercancelbybilltype is the only one of the three writes that
+        defaults its date parameter to '' rather than leaving it null
+        (firefly_api.php 7848). Non-strict MySQL coerces that into the datetime
+        column as '0000-00-00 00:00:00' and reports SUCCESS; PostgreSQL rejects
+        it, so the port answers ERROR.
+
+        Same shape as the ChequeDate problem and deliberately NOT solved the same
+        way. There, all 32 live pdcdetails rows hold the zero date, because the
+        ERP sends a blank on every sale -- the zero value IS the normal case, so
+        the column had to change type. Here, measured across every datetime
+        column of the POS tables, zero production rows hold it: the ERP always
+        sends OrderCancelDate, and only a malformed call gets here. Retyping
+        every timestamp(0) column in all 42 tables to reproduce a value that
+        exists nowhere would be a large change to make the port worse.
+
+        Erroring is also the better behaviour -- '0000-00-00 00:00:00' is a
+        corrupt date MySQL invented -- but it IS a behaviour change, so it is
+        recorded rather than hidden. See README "Known divergences".
+    #>
+    Reset-WriteSeries -BillTypeId $PosCBill -Start 1
+    Write-Host "`n--- 142. Blank OrderCancelDate into a datetime column (known divergence, informational) ---" -ForegroundColor Magenta
+    Write-Host '      MySQL stores 0000-00-00 00:00:00 and reports SUCCESS; PostgreSQL rejects the write' -ForegroundColor DarkGray
+    $blankDate = New-CancelBody
+    $blankDate.OrderCancelDate = ''
+    $phpBlank  = Invoke-Endpoint -Url $PhpUrl  -Body $blankDate
+    $nextBlank = Invoke-Endpoint -Url $NextUrl -Body $blankDate
+    Write-Host "          PHP  $($phpBlank.Body)"  -ForegroundColor Yellow
+    Write-Host "          NEXT $($nextBlank.Body)" -ForegroundColor Cyan
+
+    Reset-WriteSeries -BillTypeId $PosWBill -Start 1
+    Reset-WriteSeries -BillTypeId $PosCBill -Start 1
+    Reset-WriteSeries -BillTypeId $PosSBill -Start 1
+}
+
+Reset-PosRows
+
+# ===========================================================================
+# 143-162. Authentication and the credential endpoints.
+#
+# The master-data section ended with Reset-MasterRows and the organization was
+# cleared even earlier, so all three fixtures have to be rebuilt here:
+# customer_login joins ledger to organization, and login needs the user.
+#
+# The seeds are run through Compare-Case rather than seeded directly, which
+# costs nothing and guarantees both databases hold identical rows before any
+# auth assertion runs.
+# ===========================================================================
+
+Reset-MasterRows
+Reset-TestRows
+
+Write-Host "`n=== login / customer_login parity ===`n" -ForegroundColor White
+
+Compare-Case -Name '143. seed organization for the auth fixtures' -Body (New-OrgBody)
+Compare-Case -Name '144. seed user for the auth fixtures'         -Body (New-UserBody)
+Compare-Case -Name '145. seed ledger for the auth fixtures'       -Body (New-LedgerBody)
+
+# The success case also asserts the two SQL literals: CurrencySymbol is U+0930
+# DEVANAGARI LETTER RA, which both stacks must emit escaped as र, and
+# SubCurrencySymbol is a bare 'p'. Password comes back in the clear on both.
+Compare-Case -Name '146. login (valid credentials)' -Body @{
+    api = 'login'; UserName = 'zzuser'; Password = 'zzsecret'
+}
+Compare-Case -Name '147. login (wrong password -> the EMPTY sentinel)' -Body @{
+    api = 'login'; UserName = 'zzuser'; Password = 'wrongpassword'
+}
+Compare-Case -Name '148. login (unknown user)' -Body @{
+    api = 'login'; UserName = 'zznosuchuser'; Password = 'x'
+}
+# Both fields missing bind null, and `= NULL` matches nothing on either engine,
+# so this is the sentinel envelope rather than an error.
+Compare-Case -Name '149. login (no credentials posted at all)' -Body @{ api = 'login' }
+
+# The payload key is Password, not mypassword -- the PHP binds $_POST['Password']
+# against the l.mypassword column.
+Compare-Case -Name '150. customer_login (valid credentials)' -Body @{
+    api = 'customer_login'; UserName = 'zzledgeruser'; Password = 'zzledgersecret'
+}
+Compare-Case -Name '151. customer_login (wrong password)' -Body @{
+    api = 'customer_login'; UserName = 'zzledgeruser'; Password = 'wrongpassword'
+}
+
+# IsActive=1 is part of the WHERE, so a deactivated customer gets the same
+# generic message as a bad password -- no separate "account disabled" path.
+& $Mysql -u root fireflydb -e "UPDATE ledger SET IsActive=0 WHERE LedgerId='$TestLedger';" 2>&1 | Out-Null
+Invoke-Psql -Quiet "UPDATE ledger SET `"IsActive`" = 0 WHERE `"LedgerId`" = '$TestLedger';"
+Compare-Case -Name '152. customer_login (IsActive=0 is refused like a bad password)' -Body @{
+    api = 'customer_login'; UserName = 'zzledgeruser'; Password = 'zzledgersecret'
+}
+& $Mysql -u root fireflydb -e "UPDATE ledger SET IsActive=1 WHERE LedgerId='$TestLedger';" 2>&1 | Out-Null
+Invoke-Psql -Quiet "UPDATE ledger SET `"IsActive`" = 1 WHERE `"LedgerId`" = '$TestLedger';"
+
+Write-Host "`n=== privilege reads / uniqueness probes ===`n" -ForegroundColor White
+
+# 'Set' rather than 'Bytes': neither PHP query carries an ORDER BY, so the two
+# engines are free to return the seeded rows in a different sequence.
+Compare-Case -Name '153. get_userprivileges (seeded user)' -Body @{
+    api = 'get_userprivileges'; UserId = $TestUser
+} -Mode 'Set'
+Compare-Case -Name '154. get_userprivileges (unknown user -> "DATA NOT FOUND !!")' -Body @{
+    api = 'get_userprivileges'; UserId = 'ZZNOSUCHUSER'
+}
+
+Compare-Case -Name '155. get_userprivileges_with_properties (nested Properties object)' -Body @{
+    api = 'get_userprivileges_with_properties'; UserId = $TestUser
+} -Mode 'Set'
+# Zero rows returns null rather than the 'EMPTY' string, so no branch runs in the
+# case block and the file-level defaults survive: ERROR / Something Went Wrong!!!
+# / DATA null. None of the four envelopes in src/lib/read.ts produces that.
+Compare-Case -Name '156. get_userprivileges_with_properties (unknown user -> DATA null, STATUS ERROR)' -Body @{
+    api = 'get_userprivileges_with_properties'; UserId = 'ZZNOSUCHUSER'
+}
+# The isset() guard: DATA carries the *string* "UserId is required" and the case
+# still calls that SUCCESS, because a non-empty string is not the EMPTY sentinel.
+Compare-Case -Name '157. get_userprivileges_with_properties (UserId omitted -> SUCCESS + a string in DATA)' -Body @{
+    api = 'get_userprivileges_with_properties'
+}
+
+# Both probes answer with the *string* "true"/"false" and always report SUCCESS;
+# their 'No DATA found!!' branch is unreachable.
+Compare-Case -Name '158. check_username (taken)' -Body @{
+    api = 'check_username'; UserName = 'zzledgeruser'
+}
+Compare-Case -Name '159. check_username (free)' -Body @{
+    api = 'check_username'; UserName = 'zznosuchledgeruser'
+}
+# Excludes the ledger being edited, so its own username reads as free.
+Compare-Case -Name '160. check_usernamewithledger (own username -> free)' -Body @{
+    api = 'check_usernamewithledger'; UserName = 'zzledgeruser'; LedgerId = $TestLedger
+}
+Compare-Case -Name '161. check_usernamewithledger (another ledger holds it -> taken)' -Body @{
+    api = 'check_usernamewithledger'; UserName = 'zzledgeruser'; LedgerId = 'ZZ01-ZZLG-0000000099'
+}
+
+Write-Host "`n=== change_ledgerusernameandpassword ===`n" -ForegroundColor White
+
+# Payload key mypassword here, unlike customer_login's Password.
+Compare-Case -Name '162. change_ledgerusernameandpassword' -Body @{
+    api = 'change_ledgerusernameandpassword'; LedgerId = $TestLedger
+    UserName = 'zzledgeruser2'; mypassword = 'zzledgersecret2'
+}
+Write-Host "--- 163. Stored ledger credentials after the change ---" -ForegroundColor Magenta
+& $Mysql -u root fireflydb -e "SELECT LedgerId, UserName, mypassword FROM ledger WHERE LedgerId='$TestLedger';"
+Invoke-Psql "SELECT `"LedgerId`", `"UserName`", `"mypassword`" FROM ledger WHERE `"LedgerId`" = '$TestLedger';"
+
+# A LedgerId matching nothing updates no rows and still reports success: the PHP
+# never looks at the affected count.
+Compare-Case -Name '164. change_ledgerusernameandpassword (LedgerId matches nothing)' -Body @{
+    api = 'change_ledgerusernameandpassword'; LedgerId = 'ZZNOSUCHLEDGER'
+    UserName = 'x'; mypassword = 'y'
+}
+
+<#
+    165. Collation on the auth path. KNOWN DIVERGENCE, not asserted.
+
+    user.UserName, user.Password, ledger.UserName and ledger.mypassword are all
+    utf8mb4_unicode_ci in MySQL: case-insensitive and PAD SPACE. So 'ZZUSER' and
+    'zzsecret   ' authenticate today. PostgreSQL's = is exact and rejects both.
+
+    This is the loudest behaviour change in the batch, because the failure mode
+    is a user who simply cannot log in. Recorded rather than reproduced -- see
+    README "Known divergences" for the ICU collation that would restore it.
+#>
+Write-Host "`n--- 165. Case-insensitive credentials (known divergence, informational) ---" -ForegroundColor Magenta
+Write-Host '      MySQL authenticates a wrong-case username; PostgreSQL does not' -ForegroundColor DarkGray
+$upperUser = @{ api = 'login'; UserName = 'ZZUSER'; Password = 'zzsecret' }
+$phpUpper  = Invoke-Endpoint -Url $PhpUrl  -Body $upperUser
+$nextUpper = Invoke-Endpoint -Url $NextUrl -Body $upperUser
+Write-Host "      login with UserName='ZZUSER' (stored as 'zzuser')" -ForegroundColor DarkGray
+Write-Host "          PHP  $(Get-Status $phpUpper.Body)  $($phpUpper.Body)"  -ForegroundColor Yellow
+Write-Host "          NEXT $(Get-Status $nextUpper.Body)  $($nextUpper.Body)" -ForegroundColor Cyan
+
+$padPassword = @{ api = 'login'; UserName = 'zzuser'; Password = 'zzsecret   ' }
+$phpPad  = Invoke-Endpoint -Url $PhpUrl  -Body $padPassword
+$nextPad = Invoke-Endpoint -Url $NextUrl -Body $padPassword
+Write-Host "      login with a trailing-space password" -ForegroundColor DarkGray
+Write-Host "          PHP  $(Get-Status $phpPad.Body)"  -ForegroundColor Yellow
+Write-Host "          NEXT $(Get-Status $nextPad.Body)" -ForegroundColor Cyan
+
+# Note what this does and does not measure. It counts accounts whose usernames
+# collide case-insensitively -- pairs that MySQL cannot tell apart and
+# PostgreSQL can. Zero means the port introduces no ambiguity. It says nothing
+# about the actual lockout risk, which is a user *typing* the wrong case, and
+# which no query against the server can see.
+Write-Host "      live MySQL accounts whose usernames collide case-insensitively:" -ForegroundColor DarkGray
+& $Mysql -u root fireflydb -e "SELECT COUNT(*) AS colliding_pairs FROM ``user`` u JOIN ``user`` v ON u.UserName = v.UserName AND BINARY u.UserName <> BINARY v.UserName;"
+
+Reset-MasterRows
+Reset-TestRows
 
 Write-Host "`n=== $script:Pass passed, $script:Fail failed ===`n" -ForegroundColor White
 if ($script:Fail -gt 0) { exit 1 }

@@ -1,5 +1,10 @@
 import { HANDLERS } from "@/api/_registry";
-import { STATUS_ERROR, phpEmpty, phpJson } from "@/lib/response";
+import {
+  STATUS_ERROR,
+  globalErrorJson,
+  phpEmpty,
+  phpJson,
+} from "@/lib/response";
 
 // node-postgres cannot run on the Edge runtime.
 export const runtime = "nodejs";
@@ -36,7 +41,15 @@ export async function POST(req: Request): Promise<Response> {
     });
   }
 
-  return handler(fd);
+  // PHP's try wraps the whole switch (lines 95-3296), so an uncaught error from
+  // any case gets the four-key ERROR body rather than crashing the request.
+  // Belongs here rather than in the read helpers: one catch covers every case,
+  // present and future, and matches where the PHP puts it.
+  try {
+    return await handler(fd);
+  } catch (e) {
+    return globalErrorJson(e);
+  }
 }
 
 // PHP guards everything behind REQUEST_METHOD == 'POST', so any other verb gets

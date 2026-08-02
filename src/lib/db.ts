@@ -24,12 +24,19 @@ import { Pool, types, type PoolClient, type QueryResult, type QueryResultRow } f
  * The date case is the one that corrupts rather than merely reformats: an
  * unparsed Date is built at local midnight, so JSON.stringify shifts it back
  * across UTC and pdcdetails.ChequeDate reaches the ERP a day early
- * ("2026-07-27T18:30:00.000Z"). It is the schema's only `date` column, read by
+ * ("2026-07-27T18:30:00.000Z"). It was the schema's only `date` column, read by
  * get_pdcorcarddetails, get_pdcorcarddetailsforclearance, and -- through
  * get_pdcorcarddetailsbyrefId -- get_salemaster and get_salereturnmaster.
+ *
+ * That column is now varchar(10), so the date parser below matches nothing.
+ * Porting insert_salebybilltypewithpdc showed why a date could not stay: the
+ * ERP writes ChequeDate="" and non-strict MySQL stores '0000-00-00', which
+ * PostgreSQL's date type cannot represent -- see db/tables/pdcdetails.sql. The
+ * registration stays as the record of what a date would have done here, and
+ * costs nothing while no column has the type.
  */
 types.setTypeParser(1114, (v) => v); // timestamp(0) without time zone
-types.setTypeParser(1082, (v) => v); // date -- pdcdetails.ChequeDate only
+types.setTypeParser(1082, (v) => v); // date -- no column has this type any more
 types.setTypeParser(20, (v) => parseInt(v, 10)); // bigint -- counters.val only
 
 // Next's dev server re-evaluates modules on hot reload; without caching on

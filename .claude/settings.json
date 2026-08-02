@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(powershell -File scripts\\\\check-sql.ps1)",
+      "PowerShell(npx tsc --noEmit; if \\($?\\) { powershell -File scripts\\\\check-sql.ps1 | Select-Object -Last 3 })",
+      "PowerShell(powershell -File scripts\\\\compare-with-php.ps1 2>&1 | Select-String -Pattern '^FAIL|142\\\\.|^\\\\s+\\(PHP|NEXT\\)\\\\s+\\\\{\"STATUS\":\"\\(SUCCESS|ERROR\\)\",\"MESSAGE\":\"\\(Added New Order Success|invalid\\)|^===\\\\s+\\\\d+ passed')"
+    ]
+  }
+}

@@ -1,6 +1,8 @@
 import type { Cases } from "@/api/_types";
 import { query } from "@/lib/db";
+import { imagePaths } from "@/lib/imagepaths";
 import { post, str } from "@/lib/params";
+import { emptySentinelJson } from "@/lib/read";
 import {
   MESSAGE_ERROR,
   NULL_JSON_ARRAY,
@@ -81,7 +83,42 @@ export async function insertOrganization(fd: FormData): Promise<string> {
   }
 }
 
+/**
+ * get_organization, firefly_api.php line 3358.
+ *
+ * PHP interpolates $OrgImagePath into the SQL text twice -- once as a literal
+ * column and once inside CONCAT -- so the base URL travels with every row. Here
+ * it is bound instead, and the same $1 is referenced in both places.
+ *
+ * The ::text casts are belt-and-braces. Measured on PostgreSQL 18: a bare
+ * `$1 AS "OrgImagePath"` does resolve to text through node-postgres's extended
+ * protocol. Spelling it out documents the intent and survives a future release
+ * that infers less eagerly.
+ *
+ * `||` rather than concat(): PostgreSQL's concat() swallows NULL where MySQL's
+ * CONCAT propagates it. ImagePath is NOT NULL so the two agree today, but the
+ * whole batch uses || so there is nothing to remember.
+ *
+ * LIMIT 1 with no ORDER BY, exactly as the PHP has it -- with more than one
+ * organization row the winner is whatever the engine returns first.
+ */
+const ORGANIZATION_SQL = `SELECT "OrganizationCode", "Type", "Name", "RegionalName", "Address", "CityId", "ZipCode", "CountryCode", "Phone1", "Phone2", "Fax", "EmailId", "Url", "Description",
+$1::text AS "OrgImagePath", $1::text || "ImagePath" AS "Image", "ImagePath" AS "ImageName",
+"Longitude", "Latitude", "StartTime", "EndTime", "TINNumber"
+FROM organization LIMIT 1`;
+
 export const cases: Cases = [
+  // firefly_api.php lines 119-132.
+  [
+    "get_organization",
+    async () =>
+      emptySentinelJson("No Organization found for this location!!", async () => {
+        const { OrgImagePath } = await imagePaths();
+        const result = await query(ORGANIZATION_SQL, [OrgImagePath]);
+        return result.rows;
+      }),
+  ],
+
   // firefly_api.php lines 666-684. The only endpoint whose helper returns an
   // error *message* rather than 'FALSE', so it does not use trueFalseJson.
   [

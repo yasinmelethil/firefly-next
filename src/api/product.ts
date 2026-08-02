@@ -1,6 +1,15 @@
 import type { Cases } from "@/api/_types";
 import { query, withTransaction } from "@/lib/db";
-import { mysqlBit, mysqlInt, mysqlNumeric, phpStr, post } from "@/lib/params";
+import { imagePaths } from "@/lib/imagepaths";
+import {
+  isPhpEmpty,
+  mysqlBit,
+  mysqlInt,
+  mysqlNumeric,
+  phpStr,
+  post,
+} from "@/lib/params";
+import { emptyArrayJson, untouchedDefaultsJson } from "@/lib/read";
 import {
   FALSE,
   MESSAGE_ERROR,
@@ -246,7 +255,197 @@ export async function insertProductWithWarehouseStock(
   }
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * The catalogue reads: get_stock and get_product_with_category_withstock.
+ *
+ * The second is the largest read in the API -- the POS calls it once to fill
+ * its whole product grid, ~90 KB in practice -- and it is assembled the way the
+ * PHP assembles it: one query for the categories, one for every product across
+ * all of them, then the products are grouped onto their category in code
+ * (firefly_api.php 4307-4316).
+ *
+ * Both take an optional WarehouseId, and in both the optional predicate means a
+ * second statement rather than string concatenation. For the product query that
+ * is not a stylistic choice: the two branches select **different columns** --
+ * the no-warehouse one includes p.UnitShortName (4165) and the warehouse one
+ * does not (4233) -- so they are genuinely two shapes on the wire.
+ *
+ * Every `COALESCE(<numeric>, 0)` here carries an explicit cast. MySQL's COALESCE
+ * adopts the DECIMAL result type, so on a missed LEFT JOIN it prints
+ * "0.00000000"/"0.000"; PostgreSQL takes the integer literal's scale of 0 and
+ * prints "0". Measured on both engines. Only the NULL branch differs -- every
+ * matched row already agrees -- so the zero literal is typed rather than the
+ * whole expression, which would risk the paths that are correct today.
+ * ---------------------------------------------------------------------------
+ */
+
+const STOCK_SQL = `SELECT ws."InventoryDetailsId", SUM(ws."CurrentStock") AS "Stock"
+FROM warehousestock ws
+INNER JOIN product p ON p."InventoryDetailsId" = ws."InventoryDetailsId"
+INNER JOIN category c ON c."InventoryGroupId" = p."InventoryGroupId"
+WHERE c."OrganizationCode" = $1
+GROUP BY ws."InventoryDetailsId"`;
+
+const STOCK_BY_WAREHOUSE_SQL = `SELECT ws."InventoryDetailsId", SUM(ws."CurrentStock") AS "Stock"
+FROM warehousestock ws
+INNER JOIN product p ON p."InventoryDetailsId" = ws."InventoryDetailsId"
+INNER JOIN category c ON c."InventoryGroupId" = p."InventoryGroupId"
+WHERE c."OrganizationCode" = $1
+AND ws."WarehouseId" = $2
+GROUP BY ws."InventoryDetailsId"`;
+
+/**
+ * Isparent is the string "True" or "False", capital letter included -- not a
+ * boolean. It is one of the few EXISTS probes in the file whose result reaches
+ * the wire, so the CASE is transcribed rather than collapsed to SELECT EXISTS.
+ */
+const CATEGORY_SQL = `SELECT mc."InventoryGroupId", mc."GroupName", mc."Colour",
+(CASE WHEN EXISTS (
+    SELECT 1 FROM category sc WHERE sc."ParentGroup" = mc."InventoryGroupId"
+) THEN 'True' ELSE 'False' END) AS "Isparent",
+$2::text AS "ThumpnailPath",
+$2::text || mc."ImagePath" AS "thumbnail",
+$3::text AS "ImagePath",
+$3::text || mc."ImagePath" AS "Image",
+mc."ImagePath" AS "ImageName"
+FROM category mc
+WHERE mc."OrganizationCode" = $1`;
+
+/**
+ * The stock subquery groups by (InventoryDetailsId, Unit) while the LEFT JOIN
+ * keys on InventoryDetailsId alone, so a product stocked under two Units comes
+ * back twice. Faithful to the PHP; not deduplicated here.
+ */
+const PRODUCT_SQL = `SELECT p."InventoryDetailsId", p."InventoryGroupId", p."ProductName", p."ProductRegionalName", p."Code", p."Barcode", p."CustomBarcode", p."HSNCode",
+p."UnitShortName", p."Size", p."Colour",
+$2::text AS "ProdImagePath",
+CASE WHEN p."ImagePath" IS NULL OR TRIM(p."ImagePath") = '' THEN $2::text || 'no_image.jpg' ELSE $2::text || p."ImagePath" END AS "Image",
+$3::text AS "ProdThumpnailPath",
+CASE WHEN p."ImagePath" IS NULL OR TRIM(p."ImagePath") = '' THEN $3::text || 'no_image.jpg' ELSE $3::text || p."ImagePath" END AS "Thumpnail",
+COALESCE(p."ImagePath", '') AS "ImageName",
+p."MRP", p."SaleRate", p."MOP", p."MLOP", p."PurchaseRate", p."AvgRate", p."LastPurchaseRate", p."isVeg", p."CurrentStock", p."OrderLimit", p."Description",
+p."TaxId", COALESCE(tax."Rate", 0::numeric(10,3)) AS "TaxPercentage", COALESCE(tax."TaxType", '') AS "TaxType",
+p."AddTaxId", COALESCE(addtax."Rate", 0::numeric(10,3)) AS "AddTaxPercentage", COALESCE(addtax."TaxType", '') AS "AddTaxType",
+p."AddTaxId1", COALESCE(addtax1."Rate", 0::numeric(10,3)) AS "AddTaxPercentage1", COALESCE(addtax1."TaxType", '') AS "AddTaxType1",
+COALESCE(stock."Stock", 0::numeric(24,8)) AS "Stock", COALESCE(stock."StockUnit", '') AS "StockUnit"
+FROM product p
+LEFT JOIN taxdetails tax ON p."TaxId" = tax."TaxId"
+LEFT JOIN taxdetails addtax ON p."AddTaxId" = addtax."TaxId"
+LEFT JOIN taxdetails addtax1 ON p."AddTaxId1" = addtax1."TaxId"
+LEFT JOIN (
+    SELECT "InventoryDetailsId",
+           SUM("CurrentStock") AS "Stock",
+           COALESCE("Unit", '') AS "StockUnit"
+    FROM warehousestock
+    GROUP BY "InventoryDetailsId", "Unit"
+) stock ON stock."InventoryDetailsId" = p."InventoryDetailsId"
+INNER JOIN category cat
+    ON cat."InventoryGroupId" = p."InventoryGroupId"
+    AND cat."OrganizationCode" = $1`;
+
+/** Same as above minus UnitShortName, plus the warehouse filter. */
+const PRODUCT_BY_WAREHOUSE_SQL = `SELECT p."InventoryDetailsId", p."InventoryGroupId", p."ProductName", p."ProductRegionalName", p."Code", p."Barcode", p."CustomBarcode", p."HSNCode",
+p."Size", p."Colour",
+$2::text AS "ProdImagePath",
+CASE WHEN p."ImagePath" IS NULL OR TRIM(p."ImagePath") = '' THEN $2::text || 'no_image.jpg' ELSE $2::text || p."ImagePath" END AS "Image",
+$3::text AS "ProdThumpnailPath",
+CASE WHEN p."ImagePath" IS NULL OR TRIM(p."ImagePath") = '' THEN $3::text || 'no_image.jpg' ELSE $3::text || p."ImagePath" END AS "Thumpnail",
+COALESCE(p."ImagePath", '') AS "ImageName",
+p."MRP", p."SaleRate", p."MOP", p."MLOP", p."PurchaseRate", p."AvgRate", p."LastPurchaseRate", p."isVeg", p."CurrentStock", p."OrderLimit", p."Description",
+p."TaxId", COALESCE(tax."Rate", 0::numeric(10,3)) AS "TaxPercentage", COALESCE(tax."TaxType", '') AS "TaxType",
+p."AddTaxId", COALESCE(addtax."Rate", 0::numeric(10,3)) AS "AddTaxPercentage", COALESCE(addtax."TaxType", '') AS "AddTaxType",
+p."AddTaxId1", COALESCE(addtax1."Rate", 0::numeric(10,3)) AS "AddTaxPercentage1", COALESCE(addtax1."TaxType", '') AS "AddTaxType1",
+COALESCE(stock."Stock", 0::numeric(24,8)) AS "Stock", COALESCE(stock."StockUnit", '') AS "StockUnit"
+FROM product p
+LEFT JOIN taxdetails tax ON p."TaxId" = tax."TaxId"
+LEFT JOIN taxdetails addtax ON p."AddTaxId" = addtax."TaxId"
+LEFT JOIN taxdetails addtax1 ON p."AddTaxId1" = addtax1."TaxId"
+LEFT JOIN (
+    SELECT "InventoryDetailsId",
+           SUM("CurrentStock") AS "Stock",
+           COALESCE("Unit", '') AS "StockUnit",
+           "WarehouseId"
+    FROM warehousestock
+    GROUP BY "InventoryDetailsId", "Unit", "WarehouseId"
+) stock ON stock."InventoryDetailsId" = p."InventoryDetailsId"
+   AND stock."WarehouseId" = $4
+INNER JOIN category cat
+    ON cat."InventoryGroupId" = p."InventoryGroupId"
+    AND cat."OrganizationCode" = $1`;
+
 export const cases: Cases = [
+  // firefly_api.php lines 344-369. The one case block that turns the sentinel
+  // into a real [] rather than the string "EMPTY".
+  [
+    "get_product_with_category_withstock",
+    async (fd) =>
+      emptyArrayJson("No Product found!!", async () => {
+        const organizationCode = post(fd, "OrganizationCode");
+        const warehouseId = post(fd, "WarehouseId");
+        const paths = await imagePaths();
+
+        const categories = await query(CATEGORY_SQL, [
+          organizationCode,
+          paths.CatThumpnailPath,
+          paths.CatImagePath,
+        ]);
+        // PHP returns 'EMPTY' here without ever running the product query.
+        if (categories.rows.length === 0) {
+          return [];
+        }
+
+        const productParams = [
+          organizationCode,
+          paths.ProdImagePath,
+          paths.ProdThumpnailPath,
+        ];
+        // empty($WarehouseId), so "0" takes the no-warehouse branch.
+        const products = isPhpEmpty(warehouseId)
+          ? await query(PRODUCT_SQL, productParams)
+          : await query(PRODUCT_BY_WAREHOUSE_SQL, [
+              ...productParams,
+              warehouseId,
+            ]);
+
+        const grouped = new Map<unknown, unknown[]>();
+        for (const product of products.rows) {
+          const bucket = grouped.get(product.InventoryGroupId);
+          if (bucket) {
+            bucket.push(product);
+          } else {
+            grouped.set(product.InventoryGroupId, [product]);
+          }
+        }
+
+        // `products` is assigned onto the category object, so it is the last
+        // key of each one, after ImageName. A category with no products gets [].
+        return categories.rows.map((category) => ({
+          ...category,
+          products: grouped.get(category.InventoryGroupId) ?? [],
+        }));
+      }),
+  ],
+
+  // firefly_api.php lines 371-384.
+  //
+  // The case block is written in the 'EMPTY' sentinel shape, but get_stock
+  // returns fetchAll() directly with no sentinel, so `$DATA == $EMPTY` is never
+  // evaluated and 'No Stock found!!' at line 376 cannot be reached. Empty
+  // answers {"STATUS":"ERROR","MESSAGE":"Something Went Wrong!!!","DATA":[]}.
+  [
+    "get_stock",
+    async (fd) =>
+      untouchedDefaultsJson(async () => {
+        const organizationCode = post(fd, "OrganizationCode");
+        const warehouseId = post(fd, "WarehouseId");
+        const result = isPhpEmpty(warehouseId)
+          ? await query(STOCK_SQL, [organizationCode])
+          : await query(STOCK_BY_WAREHOUSE_SQL, [organizationCode, warehouseId]);
+        return result.rows;
+      }),
+  ],
+
   // firefly_api.php lines 1815-1829. Does not use trueFalseJson: this case
   // combines two actions and also carries the echoed-SQL prefix.
   [

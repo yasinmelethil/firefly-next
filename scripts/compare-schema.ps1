@@ -37,6 +37,21 @@ $Renames = @{
     'user.Routid'                    = 'RoutId'
 }
 
+<#
+    Columns deliberately given a PostgreSQL type the mapping rules would not
+    produce. Reported for visibility, never counted as a failure.
+
+    The one entry is the schema's only untranslated type. The ERP posts
+    ChequeDate="" on every sale and non-strict MySQL stores '0000-00-00' -- all
+    32 live rows hold it -- which PostgreSQL's date cannot represent at any
+    setting. All 24 PHP references are bare SELECT entries or PARAM_STR binds,
+    so nothing treats it as a date; mysqlDate() in src/lib/params.ts reproduces
+    the coercion MySQL used to do on the way in. See db/tables/pdcdetails.sql.
+#>
+$Retypes = @{
+    'pdcdetails.ChequeDate' = 'varchar(10)'
+}
+
 # Tables given a primary key PostgreSQL needs for ON CONFLICT but MySQL lacks.
 # Reported for visibility, never counted as a failure.
 $AddedKeys = @{
@@ -171,7 +186,11 @@ foreach ($key in ($my.Keys | Sort-Object)) {
     $p = $pg[$pgKey]
 
     if ($m.Type -ne $p.Type) {
-        $problems.Add("TYPE               $pgKey  mysql=$($m.RawType) -> expected $($m.Type), got $($p.Type)")
+        if ($Retypes.ContainsKey($pgKey) -and $Retypes[$pgKey] -eq $p.Type) {
+            $notes.Add("RETYPED (expected) $pgKey  mysql=$($m.RawType) -> $($p.Type)")
+        } else {
+            $problems.Add("TYPE               $pgKey  mysql=$($m.RawType) -> expected $($m.Type), got $($p.Type)")
+        }
     }
     if ($m.Nullable -ne $p.Nullable) {
         # A column pulled into a new primary key is necessarily NOT NULL.

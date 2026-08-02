@@ -1,8 +1,16 @@
 import type { Cases } from "@/api/_types";
 import { query } from "@/lib/db";
 import { isPhpEmpty, mysqlInt, mysqlNumeric, phpStr, post } from "@/lib/params";
-import { decodeItems } from "@/lib/read";
-import { FALSE, trueFalseJson, type TrueFalse } from "@/lib/response";
+import { decodeItems, emptySentinelJson } from "@/lib/read";
+import {
+  FALSE,
+  MESSAGE_SUCCESS,
+  STATUS_SUCCESS,
+  phpDie,
+  phpJson,
+  trueFalseJson,
+  type TrueFalse,
+} from "@/lib/response";
 import { binds, checkedSql, cols, paramOf, setList, upsertByKey } from "@/lib/sql";
 
 /**
@@ -206,7 +214,204 @@ export async function updateLedgersCurrentBalances(
   }
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * The three ledger reads the POS calls: the full list, a name search, and the
+ * bank accounts.
+ *
+ * All three return raw rows -- the case blocks echo $DATA straight into
+ * json_encode with no key rebuild -- so the SELECT column list below IS the
+ * JSON key list, in this order. They also all ship `mypassword`, the
+ * customer-portal credential, in the clear. Faithful; the README already flags
+ * that copying those values across is a separate security decision.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The 16 columns shared by get_ledgers and get_ledgersbyname. */
+const LEDGER_COLUMNS = `"LedgerName", "RegionalName", "LedgerCode", "CustomCode", "Address", "Email", "Phone", "TINNumber", "noofseats", "seatstaken", "UserName", "mypassword", "RoutId", "CurrentBalance", "IsActive"`;
+
+// LedgerType 'C' is cash and 'B' is bank; this is every ledger that is neither.
+const LEDGERS_SQL = `SELECT "LedgerId", ${LEDGER_COLUMNS}
+FROM ledger WHERE "LedgerType" != 'C' AND "LedgerType" != 'B'`;
+
+/**
+ * get_ledgersbyname, both branches (firefly_api.php 4470-4503).
+ *
+ * Three things differ from get_ledgers beyond the search:
+ *
+ *   1. LedgerId falls back to led_id when blank. In MySQL that is
+ *      COALESCE(NULLIF(LedgerId,''), led_id) over a varchar and an int, which
+ *      PostgreSQL refuses outright -- COALESCE cannot unify the two. MySQL
+ *      aggregates them to varchar and PDO reports VAR_STRING, so PHP emits a
+ *      JSON *string*; "led_id"::text reproduces that exactly. The blank rows
+ *      are the not-yet-synced customers get_newcustomers drains.
+ *   2. The LIKE is built with || rather than concat(). PostgreSQL's concat()
+ *      ignores NULL, so a missing Searchstring would become '%%' and match
+ *      every ledger, where MySQL's CONCAT returns NULL and matches none.
+ *   3. The RoutId branch also lets LedgerType 'O' through regardless of route.
+ *
+ * A blank Searchstring matches everything, which is what the POS actually
+ * sends to populate its initial list.
+ */
+const LEDGERS_BY_NAME_SQL = `SELECT COALESCE(NULLIF("LedgerId", ''), "led_id"::text) AS "LedgerId", ${LEDGER_COLUMNS}
+FROM ledger
+WHERE "LedgerType" != 'C' AND "LedgerType" != 'B' AND "LedgerName" LIKE '%' || $1 || '%'
+AND "LedgerId" NOT IN (SELECT "LedgerId" FROM userledgerprivilege WHERE "Block" = 1 AND "UserId" = $2)
+ORDER BY "LedgerName"`;
+
+const LEDGERS_BY_NAME_ROUT_SQL = `SELECT COALESCE(NULLIF("LedgerId", ''), "led_id"::text) AS "LedgerId", ${LEDGER_COLUMNS}
+FROM ledger
+WHERE "LedgerType" != 'C' AND "LedgerType" != 'B' AND "LedgerName" LIKE '%' || $1 || '%'
+AND "LedgerId" NOT IN (SELECT "LedgerId" FROM userledgerprivilege WHERE "Block" = 1 AND "UserId" = $2)
+AND ("RoutId" = $3 OR "LedgerType" = 'O')
+ORDER BY "LedgerName"`;
+
+/**
+ * get_bankdetails (firefly_api.php 4593-4607). Four columns, not sixteen.
+ *
+ * The live POS does not send UserId at all, so the bound value is null, the
+ * NOT IN subquery matches nothing, and the privilege filter is a no-op. Same on
+ * both engines: `x NOT IN (empty set)` is true.
+ */
+const BANK_DETAILS_SQL = `SELECT "LedgerId", "LedgerName", "CurrentBalance", "IsActive"
+FROM ledger WHERE "LedgerType" = 'B'
+AND "LedgerId" NOT IN (SELECT "LedgerId" FROM userledgerprivilege WHERE "Block" = 1 AND "UserId" = $1)`;
+
+/*
+ * ---------------------------------------------------------------------------
+ * The customer portal's credentials: one login, two uniqueness probes, and the
+ * endpoint that changes them.
+ *
+ * All four work on `ledger`, including check_username -- despite its name, it
+ * probes ledger.UserName, not "user".UserName. The staff login lives in
+ * src/api/user.ts.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * customer_login, firefly_api.php line 4628 -- the SELECT at 4633-4637.
+ *
+ * Longhand rather than assembled, for the same reason as LOGIN_SQL in user.ts:
+ * a `${}` makes scripts/check-sql.ps1 skip the statement, and this is one worth
+ * PREPARing. Three transcription fixes, none of which reaches the wire:
+ *
+ *   1. The PHP selects l.UserName and l.mypassword **twice** each. PDO's
+ *      FETCH_OBJ and node-postgres both keep the first occurrence's position
+ *      and emit one key, so the duplicates are simply dropped -- the same call
+ *      the three sale reads made for om.PartyDetails.
+ *   2. The organization columns are spelled DefCustSOBilltype / DefCustSIBilltype
+ *      / DefCustSRBilltype in the PHP, a casing matching neither the table nor
+ *      the write path. MySQL folds it; PostgreSQL will not. Corrected here to
+ *      the spellings in db/tables/organization.sql, which carries a note asking
+ *      for exactly this. All three are aliased, so the JSON keys are unchanged.
+ *   3. IsActive=1 filters inactive customers out, and they get the same generic
+ *      "check Username or Password" message -- no separate "account disabled".
+ *
+ * mypassword goes back to the caller in the clear, as it does in get_ledgers.
+ */
+const CUSTOMER_LOGIN_SQL = `SELECT l."OrganizationCode", l."LedgerId", l."LedgerType", l."LedgerName", l."RegionalName" AS "LedgerRegionalName", l."LedgerCode", l."CustomCode", l."UserName", l."mypassword",
+l."Address", l."Email", l."Phone", l."TINNumber", l."noofseats", l."seatstaken", l."RoutId",
+l."CurrentBalance", 'र' AS "CurrencySymbol", 'p' AS "SubCurrencySymbol", og."DefCustSOBillType" AS "DefSOBillType",
+og."DefCustSIBillType" AS "DefSIBillType", og."DefCustSRBillType" AS "DefSRBillType", og."DefCustBank" AS "DefCustBank",
+og."DefCustRate", l."IsActive"
+FROM ledger l JOIN organization og ON l."OrganizationCode" = og."OrganizationCode"
+WHERE l."UserName" = $1 AND l."mypassword" = $2 AND l."IsActive" = 1`;
+
+/*
+ * check_username (5274) and check_usernamewithledger (5286).
+ *
+ * MySQL's IF(cond, a, b) becomes CASE WHEN -- an exact translation, unlike the
+ * four constructs the README lists as having no PostgreSQL equivalent. The
+ * parenthesised shape matches the Isparent probe in src/api/product.ts, and
+ * `SELECT "UserName"` inside the EXISTS is the PHP's own spelling rather than
+ * the more idiomatic SELECT 1; the planner treats them identically.
+ *
+ * Both return the *string* 'true' or 'false', never the 'EMPTY' sentinel, so
+ * the case blocks' `$DATA == $EMPTY` branch and their 'No DATA found!!' message
+ * are dead and the response is always SUCCESS. Note for callers: "false" is a
+ * non-empty string and therefore truthy in JavaScript -- compare === "true".
+ *
+ * Neither has a try/catch, so a DB error reaches route.ts's four-key envelope.
+ */
+const CHECK_USERNAME_SQL = `SELECT (CASE WHEN EXISTS (
+    SELECT "UserName" FROM ledger WHERE "UserName" = $1
+) THEN 'true' ELSE 'false' END) AS "Result"`;
+
+// The edit-form variant: does any *other* ledger already hold this username?
+// A null LedgerId makes "LedgerId" != $2 unknown, so EXISTS is false and the
+// answer is 'false' -- identical to MySQL, where != NULL is likewise never true.
+const CHECK_USERNAME_WITH_LEDGER_SQL = `SELECT (CASE WHEN EXISTS (
+    SELECT "UserName" FROM ledger WHERE "UserName" = $1 AND "LedgerId" != $2
+) THEN 'true' ELSE 'false' END) AS "Result"`;
+
+const CHANGE_CREDENTIALS_SQL = `UPDATE ledger SET "UserName" = $1, "mypassword" = $2
+WHERE "LedgerId" = $3`;
+
+/**
+ * Port of change_ledgerusernameandpassword($dbh), firefly_api.php line 5218.
+ *
+ * Returns 'TRUE' or a Response, which is unlike every other helper here, because
+ * the PHP catch calls `die($e->getMessage())` instead of returning 'FALSE'. The
+ * body is then raw driver text with no JSON at all, and the case's echo never
+ * runs -- so its "User Name And Password Change Failed!" message is unreachable.
+ * See phpDie in src/lib/response.ts.
+ *
+ * The payload key is `mypassword`, not `Password` as in the two login endpoints.
+ * A LedgerId matching nothing updates no rows and still reports success: PHP
+ * never looks at the affected count. The `$data = $query->fetch()` at line 5230
+ * is a fetch on an UPDATE and is not ported.
+ */
+export async function changeLedgerUsernameAndPassword(
+  fd: FormData,
+): Promise<TrueFalse | Response> {
+  try {
+    await query(CHANGE_CREDENTIALS_SQL, [
+      post(fd, "UserName"),
+      post(fd, "mypassword"),
+      post(fd, "LedgerId"),
+    ]);
+    return "TRUE";
+  } catch (e) {
+    return phpDie(e instanceof Error ? e.message : String(e));
+  }
+}
+
 export const cases: Cases = [
+  // firefly_api.php lines 430-442.
+  [
+    "get_ledgers",
+    async () =>
+      emptySentinelJson("No Ledgers found!!", async () => {
+        const result = await query(LEDGERS_SQL);
+        return result.rows;
+      }),
+  ],
+
+  // firefly_api.php lines 484-496. Same empty message as get_ledgers.
+  [
+    "get_ledgersbyname",
+    async (fd) =>
+      emptySentinelJson("No Ledgers found!!", async () => {
+        const routId = post(fd, "RoutId");
+        const params = [post(fd, "Searchstring"), post(fd, "UserId")];
+        // PHP branches on empty($RoutId), so "0" takes the no-route branch.
+        const result = isPhpEmpty(routId)
+          ? await query(LEDGERS_BY_NAME_SQL, params)
+          : await query(LEDGERS_BY_NAME_ROUT_SQL, [...params, routId]);
+        return result.rows;
+      }),
+  ],
+
+  // firefly_api.php lines 541-553.
+  [
+    "get_bankdetails",
+    async (fd) =>
+      emptySentinelJson("No Cash/Bank found!!", async () => {
+        const result = await query(BANK_DETAILS_SQL, [post(fd, "UserId")]);
+        return result.rows;
+      }),
+  ],
+
   // firefly_api.php lines 1591-1606. insert_rout runs unconditionally after
   // insert_ledger, neither guarded by the other's result, and no transaction
   // spans the pair -- same shape as the product/warehousestock pairing.
@@ -243,5 +448,67 @@ export const cases: Cases = [
         "Current Balance Updation Failed!",
         "Current Balance Updation Succes!",
       ),
+  ],
+
+  // firefly_api.php lines 571-585. Byte-identical to the login case in
+  // src/api/user.ts, message included -- only the getter differs.
+  [
+    "customer_login",
+    async (fd) =>
+      emptySentinelJson("Login Failed check Username or Password !!", async () => {
+        // The payload key is Password even though the column is mypassword
+        // (firefly_api.php 4632 binds $_POST['Password'] to :Password, matched
+        // against l.mypassword). change_ledgerusernameandpassword below reads
+        // the *other* spelling, $_POST['mypassword']. Do not harmonise them.
+        const result = await query(CUSTOMER_LOGIN_SQL, [
+          post(fd, "UserName"),
+          post(fd, "Password"),
+        ]);
+        return result.rows;
+      }),
+  ],
+
+  // firefly_api.php lines 1682-1694.
+  [
+    "check_username",
+    async (fd) => {
+      const result = await query(CHECK_USERNAME_SQL, [post(fd, "UserName")]);
+      return phpJson({
+        STATUS: STATUS_SUCCESS,
+        MESSAGE: MESSAGE_SUCCESS,
+        DATA: result.rows[0].Result,
+      });
+    },
+  ],
+
+  // firefly_api.php lines 1696-1708. Same envelope, same dead branch.
+  [
+    "check_usernamewithledger",
+    async (fd) => {
+      const result = await query(CHECK_USERNAME_WITH_LEDGER_SQL, [
+        post(fd, "UserName"),
+        post(fd, "LedgerId"),
+      ]);
+      return phpJson({
+        STATUS: STATUS_SUCCESS,
+        MESSAGE: MESSAGE_SUCCESS,
+        DATA: result.rows[0].Result,
+      });
+    },
+  ],
+
+  // firefly_api.php lines 1624-1638. The helper dies rather than returning
+  // FALSE, so the failure message below can never be reached.
+  [
+    "change_ledgerusernameandpassword",
+    async (fd) => {
+      const ACTION = await changeLedgerUsernameAndPassword(fd);
+      if (ACTION instanceof Response) return ACTION;
+      return trueFalseJson(
+        ACTION,
+        "User Name And Password Change Failed!",
+        "User Name And Password Change Success!",
+      );
+    },
   ],
 ];

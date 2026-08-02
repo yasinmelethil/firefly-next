@@ -126,6 +126,63 @@ export function mysqlBit(value: string | null): number | null {
 }
 
 /**
+ * String -> DATE column, as MySQL does it.
+ *
+ * pdcdetails.ChequeDate is MySQL's only date column, and this port declares it
+ * varchar(10) because the value MySQL actually stores there --  '0000-00-00',
+ * in all 32 live rows -- is not representable as a PostgreSQL date. See
+ * db/tables/pdcdetails.sql. Holding text means the coercion MySQL used to do
+ * on the way in has to happen here instead, or the column would keep the raw
+ * '' the ERP sends and the two stacks would disagree on the wire.
+ *
+ * Measured against the live server, non-strict sql_mode:
+ *   ''           -> '0000-00-00'     '2026-07-28' -> '2026-07-28'
+ *   '  '         -> '0000-00-00'     '2026-7-8'   -> '2026-07-08'  (zero-padded)
+ *   'abc'        -> '0000-00-00'     '2026/07/28' -> '2026-07-28'  (any separator)
+ *   '2026-13-01' -> '0000-00-00'     '20260728'   -> '2026-07-28'  (compact form)
+ *   '2026-02-31' -> '0000-00-00'     '26-7-8'     -> '2026-07-08'  (2-digit year)
+ *   '2026-00-00' -> '0000-00-00'  (NO_ZERO_IN_DATE)      NULL -> NULL
+ *
+ * So MySQL parses loosely and then validates the calendar strictly, falling
+ * back to the zero date rather than erroring. The ERP only ever sends '' or a
+ * plain YYYY-MM-DD; the rest is transcribed so the fallback is a rule and not
+ * an accident.
+ */
+export function mysqlDate(value: string | null): string | null {
+  if (value === null) return null;
+  const text = value.trim();
+
+  // Any run of non-digits separates the parts; 8 bare digits is the compact form.
+  const parts = /^\d{8}$/.test(text)
+    ? [text.slice(0, 4), text.slice(4, 6), text.slice(6, 8)]
+    : text.split(/\D+/);
+  if (parts.length !== 3 || parts.some((p) => p === "" || !/^\d+$/.test(p))) {
+    return ZERO_DATE;
+  }
+
+  let [year] = parts.map(Number);
+  const [, month, day] = parts.map(Number);
+  // MySQL's two-digit year window: 00-69 is 2000s, 70-99 is 1900s.
+  if (parts[0].length <= 2) {
+    year += year < 70 ? 2000 : 1900;
+  }
+
+  // NO_ZERO_IN_DATE rejects a zero part, and the calendar rejects the rest.
+  if (year === 0 || month < 1 || month > 12 || day < 1 || day > 31) {
+    return ZERO_DATE;
+  }
+  const probe = new Date(Date.UTC(year, month - 1, day));
+  if (probe.getUTCMonth() !== month - 1 || probe.getUTCDate() !== day) {
+    return ZERO_DATE; // e.g. 2026-02-31
+  }
+
+  const pad = (n: number, width: number) => String(n).padStart(width, "0");
+  return `${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}`;
+}
+
+const ZERO_DATE = "0000-00-00";
+
+/**
  * String -> DECIMAL column, as MySQL does it.
  *
  * PostgreSQL numeric parses a numeric string happily but rejects '' and 'abc',
