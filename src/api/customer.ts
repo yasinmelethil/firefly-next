@@ -71,17 +71,28 @@ const CHILD_TABLES = [
  * `UPDATE <t> SET <col> = :LedgerId WHERE <col> = :ID`, built the way PHP
  * interpolates it.
  *
- * The WHERE clause is wrong in the original and is reproduced wrong. It compares
- * a varchar ledger column against $ID, which is led_id -- an integer surrogate
- * key -- rather than against the ledger's previous LedgerId. So every one of
- * these eight statements matches zero rows, always. Harmless in the real flow: a
- * customer new enough to be in get_newcustomers has no documents pointing at it
- * yet, and the rows that would need repointing carry LedgerId '' anyway.
+ * THIS LOOKS LIKE A BUG AND IS NOT ONE. The WHERE compares a varchar ledger
+ * column against $ID, which is led_id -- an integer surrogate key -- rather than
+ * against the ledger's previous LedgerId. That reads as an obvious mistake right
+ * up until you notice what get_ledgersbyname returns: `COALESCE(NULLIF(LedgerId,
+ * ''), led_id::text)` (src/api/ledger.ts). led_id-as-text IS the identifier this
+ * system uses for a customer the ERP has not assigned an id to yet. The POS
+ * picks a customer out of that list and posts it into salemaster."LedgerId";
+ * these eight statements are what rewrite those documents afterwards. It is the
+ * write-back half of the drain, not a typo.
+ *
+ * An earlier revision of this comment claimed the statements "match zero rows,
+ * always". That was true only because placeOrder used to write '' into
+ * ordermaster."LedgerId" -- a value nothing here can key on. It now writes
+ * led_id::text, the same convention the POS already had, so a web order taken
+ * before the ERP came online is repaired by this loop on the ERP's next poll.
+ * That is the whole point of D-012 and it depends on this WHERE staying exactly
+ * as it is. Do not "fix" it.
  *
  * Because of that the ID parameter must be bound as text, which post() does. Bind
  * it as a number and PostgreSQL raises "operator does not exist: character
- * varying = integer", turning MySQL's silent no-op into a hard failure and a
- * rolled-back transaction.
+ * varying = integer" -- a hard failure and a rolled-back transaction where MySQL
+ * would have coerced. This is now load-bearing rather than incidental.
  */
 const CHILD_SQL: readonly string[] = CHILD_TABLES.map(([table, column]) =>
   checkedSql(
